@@ -17,8 +17,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CameraConfig:
-    """摄像头配置"""
-    device_id: int = 1
+    """摄像头配置
+
+    macOS 上推荐使用 device_name 或 unique_id（最稳定），VisionService 会
+    自动使用 AVFoundation 原生驱动，绕过 OpenCV 易变的整数索引。
+
+    示例设备名称（通过 `python -m services.vision_service --list-cameras` 查看）：
+        "1080P USB Camera"  -> 外接 USB 摄像头 (1920x1080)
+        "USB摄像头"         -> 末端/机械臂摄像头 (1280x720)
+        "FaceTime高清相机"  -> 笔记本自带摄像头
+
+    unique_id 是硬件级稳定标识，插拔不变；优先级：unique_id > device_name > device_id。
+    """
+    device_id: int = 1   # OpenCV 设备索引（Linux/Windows 使用；macOS 仅作 fallback）
+    device_name: str = ""  # 按名称查找摄像头（例如 "USB摄像头"），非空时优先于 device_id
+    unique_id: str = ""    # macOS AVFoundation 稳定硬件标识（最优先）
     width: int = 1920     # 摄像头原始分辨率
     height: int = 1080
     fps: int = 30

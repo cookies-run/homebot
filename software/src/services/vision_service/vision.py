@@ -28,21 +28,39 @@ class VisionService:
         if config is None:
             config = get_config()
         self._config = config
-        
-        # 从配置获取地址
-        pub_addr = getattr(config, 'zmq', config).vision_pub_addr if hasattr(config, 'zmq') else pub_addr
-        if hasattr(config, 'network') and hasattr(config.network, 'zmq'):
-            pub_addr = config.network.zmq.vision_pub_addr
+
+        # 从配置获取地址（仅在未显式传入 pub_addr 时）
+        # 优先级: 传入的 pub_addr 参数 > config 中的配置
+        if pub_addr == "tcp://*:5560":  # 只有使用默认值时才从 config 读取
+            if hasattr(config, 'zmq') and hasattr(config.zmq, 'vision_pub_addr'):
+                pub_addr = config.zmq.vision_pub_addr
+            elif hasattr(config, 'network') and hasattr(config.network, 'zmq') and hasattr(config.network.zmq, 'vision_pub_addr'):
+                pub_addr = config.network.zmq.vision_pub_addr
             
         # 创建 PUB socket 用于发布图像帧
         self._pub_socket = create_socket(zmq.PUB, bind=True, address=pub_addr)
         logger.info(f"VisionService PUB socket bound to {pub_addr}")
         
         # 相机配置
-        self._cam_device = getattr(config.camera, 'device_id', 0) if hasattr(config, 'camera') else 0
-        self._fps = getattr(config.camera, 'fps', 30) if hasattr(config, 'camera') else 30
-        self._width = getattr(config.camera, 'width', 640) if hasattr(config, 'camera') else 640
-        self._height = getattr(config.camera, 'height', 480) if hasattr(config, 'camera') else 480
+        if hasattr(config, 'camera') and config.camera:
+            import platform
+            device_name = getattr(config.camera, 'device_name', '')
+            unique_id = getattr(config.camera, 'unique_id', '')
+            if platform.system() == 'Darwin' and (device_name or unique_id):
+                # macOS 使用 AVFoundation 原生驱动，按名称/uniqueID 匹配，
+                # 不经过 OpenCV 的整数索引，因此跳过 resolve_device_id。
+                self._cam_device = -1
+            else:
+                from hal.camera.enumeration import resolve_device_id
+                self._cam_device = resolve_device_id(config)
+            self._fps = getattr(config.camera, 'fps', 30)
+            self._width = getattr(config.camera, 'width', 640)
+            self._height = getattr(config.camera, 'height', 480)
+        else:
+            self._cam_device = 0
+            self._fps = 30
+            self._width = 640
+            self._height = 480
         
         # 相机驱动 (延迟初始化)
         self._cam = None
@@ -51,10 +69,44 @@ class VisionService:
         self._running = False
 
     def _init_camera(self):
-        """初始化相机驱动."""
-        from hal.camera.driver import CameraDriver
-        self._cam = CameraDriver(self._cam_device)
-        logger.info(f"Camera initialized: device={self._cam_device}, fps={self._fps}")
+        """初始化相机驱动.
+
+        macOS 上如果配置了 device_name，使用原生的 AVFoundation 驱动以绕过
+        OpenCV 不稳定的整数索引；否则回退到 OpenCV CameraDriver。
+        """
+        import platform
+        camera_cfg = getattr(self._config, 'camera', None)
+        device_name = getattr(camera_cfg, 'device_name', '') if camera_cfg else ''
+        unique_id = getattr(camera_cfg, 'unique_id', '') if camera_cfg else ''
+
+        if platform.system() == 'Darwin' and (device_name or unique_id):
+            from hal.camera.avfoundation_driver import AVFoundationCameraDriver
+            # unique_id 优先；如果配置了 unique_id，按硬件 ID 直接匹配。
+            lookup_name = unique_id if unique_id else device_name
+            self._cam = AVFoundationCameraDriver(
+                device_name=lookup_name,
+                width=self._width,
+                height=self._height,
+                fps=self._fps,
+                flip_horizontal=True,
+            )
+            resolved_uid = getattr(self._cam, 'unique_id', '')
+            logger.info(
+                f"AVFoundation camera initialized: name='{device_name}', unique_id={resolved_uid}, "
+                f"fps={self._fps}, resolution={self._width}x{self._height}, flip_horizontal=True"
+            )
+        else:
+            from hal.camera.driver import CameraDriver
+            self._cam = CameraDriver(
+                self._cam_device,
+                flip_horizontal=True,
+                width=self._width,
+                height=self._height,
+            )
+            logger.info(
+                f"OpenCV camera initialized: device={self._cam_device}, fps={self._fps}, "
+                f"resolution={self._width}x{self._height}, flip_horizontal=True"
+            )
 
     def process_frame(self, frame):
         """处理图像帧 (子类可重写此方法添加视觉处理逻辑).
@@ -84,18 +136,31 @@ class VisionService:
         tgt_int = 1.0 / self._fps if self._fps > 0 else 0
         
         logger.info(f"VisionService started publishing at {self._fps} FPS")
-        
+
+        consecutive_failures = 0
+        MAX_FAILURES_BEFORE_REOPEN = 5
+
         try:
             perf = time.perf_counter
             while self._running:
                 t0 = perf()
-                
+
                 # 1. 采集图像
                 frame = self._cam.capture_frame()
                 if frame is None:
-                    logger.warning("no frame captured")
+                    consecutive_failures += 1
+                    logger.warning(f"no frame captured (consecutive failures: {consecutive_failures})")
+                    if consecutive_failures >= MAX_FAILURES_BEFORE_REOPEN:
+                        logger.warning("too many consecutive failures, attempting camera reopen...")
+                        if self._cam.reopen():
+                            consecutive_failures = 0
+                            logger.info("camera reopened successfully")
+                        else:
+                            logger.error("camera reopen failed, will retry")
                     time.sleep(0.1)
                     continue
+                else:
+                    consecutive_failures = 0
                 
                 # 2. 处理图像 (子类可扩展)
                 processed_frame = self.process_frame(frame)
