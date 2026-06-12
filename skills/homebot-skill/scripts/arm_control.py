@@ -20,7 +20,7 @@ from typing import Dict, Optional
 from dataclasses import dataclass
 
 # ============ 配置 ============
-ROBOT_IP = "192.168.1.13"
+ROBOT_IP = "127.0.0.1"
 ROBOT_PORT = 5557  # 与HomeBot配置一致: arm_service_addr = "tcp://*:5557"
 DEFAULT_SOURCE = "picoclaw"
 DEFAULT_PRIORITY = 2
@@ -204,7 +204,30 @@ class HomeBotArmController:
     def get_status(self) -> Optional[ArbiterResponse]:
         """获取当前状态（所有关节角度）"""
         # 获取状态使用system高优先级，不会抢占控制除非空闲
-        return self.send_command({}, speed=DEFAULT_SPEED, source="system", priority=4)
+        # 必须标记 query=true，否则服务端会把空 joints 当成 home 指令
+        command = {
+            "source": "system",
+            "priority": 4,
+            "speed": DEFAULT_SPEED,
+            "joints": {},
+            "timestamp": time.time(),
+            "query": True,
+        }
+        try:
+            self._socket.send_json(command)
+            response_data = self._socket.recv_json()
+            return ArbiterResponse(
+                success=response_data.get("success", False),
+                message=response_data.get("message", ""),
+                current_owner=response_data.get("current_owner", ""),
+                current_priority=response_data.get("current_priority", 0),
+                joint_states=response_data.get("joint_states", None)
+            )
+        except zmq.ZMQError as e:
+            # 超时或错误，重建socket
+            self._socket.close()
+            self._socket = self._create_socket()
+            return None
     
     def close(self):
         """关闭客户端"""

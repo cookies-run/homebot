@@ -29,7 +29,8 @@ SERVICES = [
         "name": "Vision Service",
         "module": "services.vision_service",
         "port": 5560,
-        "desc": "Vision Service"
+        "desc": "Vision Service",
+        "args": ["--device-name", "1080P USB Camera"]
     },
     {
         "name": "WakeupASR Service",
@@ -47,8 +48,9 @@ SERVICES = [
     {
         "name": "Web Control",
         "module": "applications.remote_control",
-        "port": 5000,
-        "desc": "Web Server"
+        "port": 5001,
+        "desc": "Web Server",
+        "args": ["--host", "0.0.0.0", "--port", "5001"]
     }
 ]
 
@@ -190,70 +192,91 @@ def prompt_user(occupied):
         return False
 
 
-def start_service(svc, src_dir):
-    """启动单个服务"""
+# 全局存储启动的进程，方便停止
+_started_processes = []
+
+
+def get_venv_python(script_dir):
+    """获取虚拟环境中的 Python 解释器路径"""
+    # 检查当前是否已在 venv 中
+    if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.prefix != sys.base_prefix):
+        return sys.executable
+
+    # 尝试找到项目 venv
+    venv_python = Path(script_dir).parent / "venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+
+    # Windows 路径
+    venv_python_win = Path(script_dir).parent / "venv" / "Scripts" / "python.exe"
+    if venv_python_win.exists():
+        return str(venv_python_win)
+
+    return sys.executable
+
+
+def start_service(svc, src_dir, python_exec, log_dir):
+    """启动单个服务（在当前终端后台运行）"""
     print(f"[Start] Starting {svc['name']}...")
-    
-    cmd = [sys.executable, "-m", svc["module"]]
-    
+
+    cmd = [python_exec, "-m", svc["module"]]
+
     # 添加额外参数（如果有）
     if "args" in svc:
         cmd.extend(svc["args"])
-    
-    # 在新窗口中启动（跨平台）
-    if platform.system() == "Windows":
-        # Windows: 使用 start 命令
-        # 构建完整的命令
-        cmd_parts = [f'"{sys.executable}"', "-m", svc["module"]]
-        if "args" in svc:
-            cmd_parts.extend(svc["args"])
-        cmd_str = " ".join(cmd_parts)
-        
-        # 使用 start 命令在新窗口中运行
-        # start "标题" cmd /k "命令" - 第一个引号是窗口标题
-        subprocess.Popen(
-            f'start "{svc["name"]}" cmd /k "cd /d \"{src_dir}\" && {cmd_str}"',
-            shell=True
-        )
-    elif platform.system() == "Darwin":
-        # macOS: 使用 osascript
-        script = f'''
-        tell application "Terminal"
-            do script "cd {src_dir} && {sys.executable} -m {svc['module']}"
-            set custom title of front window to "{svc['name']}"
-        end tell
-        '''
-        subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        # Linux: 尝试使用各种终端
-        cmd_str = f"cd {src_dir} && {sys.executable} -m {svc['module']}"
-        
-        terminals = [
-            ("gnome-terminal", ["--title", svc["name"], "--", "bash", "-c", f"{cmd_str}; exec bash"]),
-            ("konsole", ["--new-tab", "-p", f"tabtitle={svc['name']}", "-e", "bash", "-c", f"{cmd_str}; exec bash"]),
-            ("xterm", ["-T", svc["name"], "-e", "bash", "-c", f"{cmd_str}; exec bash"]),
-        ]
-        
-        started = False
-        for term, args in terminals:
-            if subprocess.run(["which", term], capture_output=True).returncode == 0:
-                subprocess.Popen([term] + args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                started = True
-                break
-        
-        if not started:
-            # 没有可用的终端模拟器，后台运行
-            print(f"   [Note] No terminal emulator found, running {svc['name']} in background...")
-            subprocess.Popen(cmd, cwd=src_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 设置环境变量
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(src_dir)
+
+    # 日志文件
+    log_file = log_dir / f"{svc['module'].replace('.', '_')}.log"
+
+    # 在当前终端后台运行，输出写入日志文件
+    log_fp = open(log_file, "w")
+    proc = subprocess.Popen(
+        cmd,
+        cwd=src_dir,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+
+    _started_processes.append({
+        "name": svc["name"],
+        "proc": proc,
+        "log": log_file,
+    })
+
+    print(f"   [PID {proc.pid}] {svc['name']} -> {log_file}")
+
+
+def stop_all_services():
+    """停止所有已启动的服务"""
+    print()
+    print("=" * 50)
+    print("[Stop] Stopping all services...")
+    for item in _started_processes:
+        proc = item["proc"]
+        if proc.poll() is None:  # 还在运行
+            print(f"   Stopping {item['name']} (PID {proc.pid})...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    print("[OK] All services stopped.")
+    print("=" * 50)
 
 
 def main():
     """主函数"""
     print_header()
-    
+
     # 检查端口
     occupied = check_ports()
-    
+
     # 如果有端口被占用，询问用户
     if occupied:
         if not prompt_user(occupied):
@@ -262,49 +285,103 @@ def main():
     else:
         print("[OK] All ports are available")
         print()
-    
+
     # 切换到 src 目录
     script_dir = Path(__file__).parent
     src_dir = script_dir / "src"
-    
+
     if not src_dir.exists():
         print(f"[Error] Directory not found: {src_dir}")
         input("\nPress Enter to exit...")
         sys.exit(1)
-    
+
+    # 日志目录
+    log_dir = script_dir / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    # 获取 Python 解释器
+    python_exec = get_venv_python(script_dir)
+    print(f"[Info] Python: {python_exec}")
+    print(f"[Info] Log dir: {log_dir}")
+    print()
+
+    # 注册退出清理
+    def signal_handler(signum, _frame):
+        print(f"\n[Signal] Received signal {signum}")
+        stop_all_services()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # 启动所有服务
     for svc in SERVICES:
-        start_service(svc, str(src_dir))
-        if svc != SERVICES[-1]:  # 不是最后一个服务，等待一下
-            time.sleep(2)
-    
-    # 打印完成信息
+        start_service(svc, str(src_dir), python_exec, log_dir)
+        if svc != SERVICES[-1]:
+            time.sleep(1)
+
+    # 等待服务启动
     print()
+    print("Waiting for services to start...")
+    time.sleep(3)
+
+    # 检查启动状态
+    running = sum(1 for item in _started_processes if item["proc"].poll() is None)
+    print(f"[Status] {running}/{len(_started_processes)} services running")
+    print()
+
+    # 打印完成信息
     print("=" * 50)
     print("[OK] All services started!")
     print()
     print("Services:")
-    for svc in SERVICES:
-        if svc.get("port") is None:
-            print(f"   - {svc['name']} ({svc['desc']})")
-        elif svc["name"] == "Web Control":
-            print(f"   - {svc['name']} (Flask: http://0.0.0.0:{svc['port']})")
-        elif svc["name"] == "Motion Service":
-            print(f"   - {svc['name']} (ZeroMQ: tcp://127.0.0.1:{svc['port']} & :{svc['port2']})")
-        else:
-            proto = "Camera" if "Vision" in svc["name"] else "ZeroMQ"
-            print(f"   - {svc['name']} ({proto}: tcp://127.0.0.1:{svc['port']})")
+    for item in _started_processes:
+        proc = item["proc"]
+        status = "Running" if proc.poll() is None else f"Exit {proc.poll()}"
+        print(f"   - {item['name']} [{status}] -> {item['log']}")
     print()
-    print("URL: http://localhost:5000")
-    print("Video: http://localhost:5000/video_feed")
+
+    # 从 SERVICES 中获取 Web 控制端的实际端口
+    web_port = 5001
+    for svc in SERVICES:
+        if svc["name"] == "Web Control":
+            web_port = svc.get("port", 5001)
+            break
+
+    # 获取局域网IP
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        lan_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        lan_ip = "127.0.0.1"
+
+    print("访问地址:")
+    print(f"   本机:     http://localhost:{web_port}")
+    if lan_ip != "127.0.0.1":
+        print(f"   局域网:   http://{lan_ip}:{web_port}")
+    print(f"   视频流:   http://localhost:{web_port}/video_feed")
     print("=" * 50)
-    
-    input("\nPress Enter to exit...")
+    print()
+    print("按 Ctrl+C 停止所有服务")
+    print()
+
+    # 保持运行，等待用户中断
+    try:
+        while True:
+            time.sleep(1)
+            # 检查是否有服务异常退出
+            for item in _started_processes:
+                if item["proc"].poll() is not None and item["proc"].poll() != 0:
+                    print(f"[WARN] {item['name']} exited with code {item['proc'].poll()}")
+                    print(f"       Check log: {item['log']}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_all_services()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n[Exit] Interrupted by user.")
-        sys.exit(0)
+    main()

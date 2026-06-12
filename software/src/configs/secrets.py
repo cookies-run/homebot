@@ -69,9 +69,15 @@ _load_all_env_files()
 
 @dataclass
 class TTSSecrets:
-    """TTS 密钥配置"""
+    """TTS 密钥配置（支持多提供商）"""
+    # 火山引擎专用
     appid: str = ""
     access_token: str = ""
+    # 通用字段（MiniMax 等复用）
+    api_key: str = ""
+    api_url: str = ""
+    model: str = ""
+    # 非敏感配置覆盖
     resource_id: str = "seed-tts-2.0"
     voice_type: str = "zh_female_vv_uranus_bigtts"
 
@@ -146,8 +152,11 @@ def load_secrets() -> Secrets:
     tts = TTSSecrets(
         appid=_get_env("VOLCANO_APPID", _get_env("TTS_APPID", "")),
         access_token=_get_env("VOLCANO_ACCESS_TOKEN", _get_env("TTS_ACCESS_TOKEN", "")),
+        api_key=_get_env("MINIMAX_TTS_API_KEY", _get_env("TTS_API_KEY", "")),
+        api_url=_get_env("MINIMAX_TTS_API_URL", _get_env("TTS_API_URL", "")),
+        model=_get_env("MINIMAX_TTS_MODEL", _get_env("TTS_MODEL", "")),
         resource_id=_get_env("VOLCANO_RESOURCE_ID", "seed-tts-2.0"),
-        voice_type=_get_env("VOLCANO_VOICE_TYPE", "zh_female_vv_uranus_bigtts"),
+        voice_type=_get_env("VOLCANO_VOICE_TYPE", _get_env("TTS_VOICE_TYPE", "zh_female_vv_uranus_bigtts")),
     )
     
     # LLM 配置 - 优先使用火山Ark，兼容DeepSeek
@@ -256,13 +265,13 @@ def check_secrets(verbose: bool = True) -> dict:
         # LLM 状态
         llm_ok = status["llm"]["configured"]
         status_icon = "[OK]" if llm_ok else "[MISSING]"
-        print(f"\n[LLM] 火山Ark LLM: {status_icon}")
+        print(f"\n[LLM] 大语言模型: {status_icon}")
         if llm_ok:
             print(f"   API Key: {status['llm']['api_key']}")
             print(f"   Model: {status['llm']['model'] if status['llm']['model'] else '(未设置，必填)'}")
         else:
-            print("   [提示] 设置 ARK_API_KEY 和 ARK_MODEL_ID 环境变量")
-            print("   ARK_MODEL_ID 格式: ep-20250324123456-abcdef")
+            print("   [提示] 设置 LLM_API_KEY 和 LLM_MODEL 环境变量")
+            print("   支持: MiniMax / 火山Ark / DeepSeek 等 OpenAI 兼容接口")
         
         # Vision 状态
         vision_ok = status["vision"]["configured"]
@@ -313,21 +322,21 @@ def require_secrets(service: str) -> None:
     
     elif service == "llm":
         if not secrets.llm.api_key:
-            logger.error("火山Ark LLM API Key 未配置")
-            print("\n[错误] 火山Ark LLM API Key 未配置")
+            logger.error("LLM API Key 未配置")
+            print("\n[错误] LLM API Key 未配置")
             print("\n请设置以下环境变量:")
-            print("  ARK_API_KEY=your_api_key")
-            print("  ARK_MODEL_ID=ep-your_model_id")
+            print("  LLM_API_KEY=your_api_key")
+            print("  LLM_MODEL=your_model_id")
             print(f"\n或创建 {PROJECT_ROOT / '.env.local'} 文件，格式如下:")
-            print("  ARK_API_KEY=your_api_key")
-            print("  ARK_MODEL_ID=ep-20250324123456-abcdef")
+            print("  LLM_API_KEY=your_api_key")
+            print("  LLM_API_URL=https://api.minimax.chat/v1")
+            print("  LLM_MODEL=MiniMax-M2.7-highspeed")
             sys.exit(1)
         if not secrets.llm.model:
-            logger.error("火山Ark 模型ID未配置")
-            print("\n[错误] 火山Ark 模型ID未配置")
-            print("\n请在 .env.local 文件中设置 ARK_MODEL_ID:")
-            print("  ARK_MODEL_ID=ep-20250324123456-abcdef")
-            print("\n注意: 需要在火山方舟控制台创建推理接入点并复制模型ID")
+            logger.error("LLM 模型ID未配置")
+            print("\n[错误] LLM 模型ID未配置")
+            print("\n请在 .env.local 文件中设置 LLM_MODEL:")
+            print("  LLM_MODEL=MiniMax-M2.7-highspeed")
             sys.exit(1)
     
     elif service == "vision":

@@ -230,26 +230,30 @@ class AVFoundationCameraDriver:
 
     def __init__(
         self,
-        device_name: str,
+        device_name: str = "",
+        unique_id: str = "",
         width: int = 0,
         height: int = 0,
         fps: int = 30,
         flip_horizontal: bool = True,
     ):
-        """Open the camera identified by ``device_name``.
+        """Open the camera identified by ``device_name`` or ``unique_id``.
 
         Args:
             device_name: Substring of the camera's localized name. On your
                 system this is e.g. ``"USB摄像头"`` or ``"1080P USB Camera"``.
+            unique_id: Hardware-level stable identifier (e.g. ``"0x11200000bdc8088"``).
+                Takes precedence over ``device_name`` when both are provided.
             width: Requested capture width (0 = use camera default).
             height: Requested capture height (0 = use camera default).
             fps: Requested capture rate (best-effort; see ``_apply_fps``).
             flip_horizontal: Whether to mirror the frame horizontally.
         """
-        if not device_name:
-            raise ValueError("device_name must be a non-empty string for AVFoundation driver")
+        if not device_name and not unique_id:
+            raise ValueError("Either device_name or unique_id must be provided for AVFoundation driver")
 
         self._device_name = device_name
+        self._target_unique_id = unique_id
         self._target_width = int(width)
         self._target_height = int(height)
         self._fps = int(fps)
@@ -265,7 +269,7 @@ class AVFoundationCameraDriver:
 
         self._start_session()
         logger.info(
-            f"[AVFCamera] opened '{self._device_name}' (uid={self._unique_id}) "
+            f"[AVFCamera] opened '{self._device_name or self._target_unique_id}' (uid={self._unique_id}) "
             f"at {self._actual_width}x{self._actual_height}, flip={self._flip_horizontal}"
         )
 
@@ -273,10 +277,22 @@ class AVFoundationCameraDriver:
     # Internal helpers
     # ------------------------------------------------------------------
     def _start_session(self) -> None:
-        device = find_avfoundation_device(self._device_name)
+        device = None
+        # 1. 优先通过 unique_id 精确匹配
+        if self._target_unique_id:
+            device = AVCaptureDevice.deviceWithUniqueID_(self._target_unique_id)
+            if device is None:
+                logger.warning(
+                    f"[AVFCamera] unique_id '{self._target_unique_id}' not found, "
+                    f"falling back to device_name matching"
+                )
+        # 2. 通过 device_name 子串匹配
+        if device is None and self._device_name:
+            device = find_avfoundation_device(self._device_name)
         if device is None:
             raise RuntimeError(
-                f"AVFoundation camera matching '{self._device_name}' not found"
+                f"AVFoundation camera not found: "
+                f"unique_id='{self._target_unique_id}', device_name='{self._device_name}'"
             )
         self._unique_id = str(device.uniqueID())
 

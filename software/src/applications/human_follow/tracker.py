@@ -378,13 +378,16 @@ if __name__ == "__main__":
         ret, frame = cap.read()
         if not ret:
             break
-        
+
+        # 水平翻转，解决 USB 摄像头镜像问题
+        frame = cv2.flip(frame, 1)
+
         # 检测
         detections = detector.detect(frame)
-        
+
         # 跟踪
         target = tracker.update(detections)
-        
+
         # 绘制
         output = frame.copy()
         

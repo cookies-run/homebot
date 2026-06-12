@@ -472,13 +472,17 @@ class ArmClient:
         )
         # 限制在合理范围内
         new_angles["wrist_flex"] = max(-90, min(90, new_angles["wrist_flex"]))
-        
-        # 发送命令
-        response = self.send_command(
-            {k: v for k, v in new_angles.items() if k != "gripper"},
-            speed=0,
-            priority=1
-        )
+
+        # 构建要发送的关节字典 —— 只发送实际被修改的关节，避免覆盖用户手动设置的值（如 wrist_roll）
+        joints_to_send: Dict[str, float] = {}
+        if x != 0:
+            joints_to_send["base"] = new_angles["base"]
+        if y != 0:
+            joints_to_send["shoulder"] = new_angles["shoulder"]
+            joints_to_send["elbow"] = new_angles["elbow"]
+            joints_to_send["wrist_flex"] = new_angles["wrist_flex"]
+
+        response = self.send_command(joints_to_send, speed=0, priority=1)
         
         if response.get("success"):
             self._current_angles = new_angles

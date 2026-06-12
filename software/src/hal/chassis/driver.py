@@ -234,14 +234,19 @@ class ChassisDriver:
         return (self._current_vx, self._current_vy, self._current_omega)
 
     def close(self) -> None:
-        """关闭底盘驱动"""
+        """关闭底盘驱动
+
+        共享总线模式下只释放扭矩，不断开总线（由 ServoBusManager 统一管理）。
+        """
         if not self._initialized:
             return  # 已经关闭，避免重复操作
         self.stop()
         time.sleep(0.1)
         self.bus.torque_disable()
         time.sleep(0.1)
-        self.bus.disconnect()
+        # 仅独立模式需要断开总线，共享总线由 ServoBusManager 统一管理
+        if not self._shared_bus:
+            self.bus.disconnect()
         self._initialized = False
         print("[Chassis] Closed")
 

@@ -170,72 +170,85 @@ class ArmService:
     
     def _arbitrate(self, cmd: ArmCommand) -> ArmResponse:
         """仲裁核心逻辑 - 优化版本，不读取关节状态以减少延迟"""
-        # 处理查询请求（只读关节状态，不执行运动）
-        if cmd.query:
-            joint_states = self._get_current_joint_states()
+        try:
+            # 处理查询请求（只读关节状态，不执行运动）
+            if cmd.query:
+                joint_states = self._get_current_joint_states()
+                return ArmResponse(
+                    success=True,
+                    message="查询成功",
+                    current_owner=self._current_owner or "none",
+                    current_priority=self._current_priority,
+                    joint_states=joint_states
+                )
+
+            with self._lock:
+                self._check_timeout()
+
+                new_priority = cmd.priority
+
+                if self._current_owner is None:
+                    self._current_owner = cmd.source
+                    self._current_priority = new_priority
+                    self._last_command_time = time.time()
+                    success = self._execute_to_hardware(cmd)
+
+                    return ArmResponse(
+                        success=success,
+                        message="指令已接受" if success else "执行失败",
+                        current_owner=cmd.source,
+                        current_priority=new_priority,
+                        joint_states=None  # 不读取关节状态，减少延迟
+                    )
+
+                elif new_priority >= self._current_priority:
+                    old_owner = self._current_owner
+                    self._current_owner = cmd.source
+                    self._current_priority = new_priority
+                    self._last_command_time = time.time()
+                    success = self._execute_to_hardware(cmd)
+
+                    msg = "抢占控制权" if old_owner != cmd.source else "续期控制权"
+                    return ArmResponse(
+                        success=success,
+                        message=f"指令已接受（{msg}）" if success else "执行失败",
+                        current_owner=cmd.source,
+                        current_priority=new_priority,
+                        joint_states=None  # 不读取关节状态，减少延迟
+                    )
+                else:
+                    return ArmResponse(
+                        success=False,
+                        message=f"优先级不足，当前被 {self._current_owner} 占用",
+                        current_owner=self._current_owner,
+                        current_priority=self._current_priority
+                    )
+        except Exception as e:
+            print(f"[ARM_SVC] [ERROR] 仲裁异常: {e}")
             return ArmResponse(
-                success=True,
-                message="查询成功",
+                success=False,
+                message=f"内部错误: {e}",
                 current_owner=self._current_owner or "none",
-                current_priority=self._current_priority,
-                joint_states=joint_states
+                current_priority=self._current_priority
             )
-        
-        with self._lock:
-            self._check_timeout()
-            
-            new_priority = cmd.priority
-            
-            if self._current_owner is None:
-                self._current_owner = cmd.source
-                self._current_priority = new_priority
-                self._last_command_time = time.time()
-                success = self._execute_to_hardware(cmd)
-                
-                return ArmResponse(
-                    success=success,
-                    message="指令已接受" if success else "执行失败",
-                    current_owner=cmd.source,
-                    current_priority=new_priority,
-                    joint_states=None  # 不读取关节状态，减少延迟
-                )
-            
-            elif new_priority >= self._current_priority:
-                old_owner = self._current_owner
-                self._current_owner = cmd.source
-                self._current_priority = new_priority
-                self._last_command_time = time.time()
-                success = self._execute_to_hardware(cmd)
-                
-                msg = "抢占控制权" if old_owner != cmd.source else "续期控制权"
-                return ArmResponse(
-                    success=success,
-                    message=f"指令已接受（{msg}）" if success else "执行失败",
-                    current_owner=cmd.source,
-                    current_priority=new_priority,
-                    joint_states=None  # 不读取关节状态，减少延迟
-                )
-            else:
-                return ArmResponse(
-                    success=False,
-                    message=f"优先级不足，当前被 {self._current_owner} 占用",
-                    current_owner=self._current_owner,
-                    current_priority=self._current_priority
-                )
     
     def _execute_to_hardware(self, cmd: ArmCommand) -> bool:
         """执行指令到机械臂硬件 - 使用批量写入优化性能"""
         if not cmd.joint_angles:
             print("[ARM_SVC] [SKIP] 空关节角度指令")
             return True
-        
-        # 使用批量写入替代逐个写入，性能提升约6倍
-        success = self._sync_write_joints(cmd.joint_angles, speed=cmd.speed)
-        
-        status = "OK" if success else "FAIL"
-        angles_str = ", ".join([f"{k}={v:.1f}" for k, v in cmd.joint_angles.items()])
-        print(f"[ARM_SVC] [{status}] {angles_str} [from {cmd.source}]")
-        return success
+
+        try:
+            # 使用批量写入替代逐个写入，性能提升约6倍
+            success = self._sync_write_joints(cmd.joint_angles, speed=cmd.speed)
+
+            status = "OK" if success else "FAIL"
+            angles_str = ", ".join([f"{k}={v:.1f}" for k, v in cmd.joint_angles.items()])
+            print(f"[ARM_SVC] [{status}] {angles_str} [from {cmd.source}]")
+            return success
+        except Exception as e:
+            print(f"[ARM_SVC] [ERROR] 执行硬件指令失败: {e}")
+            return False
     
     def _sync_write_joints(self, joint_angles: Dict[str, float], speed: int) -> bool:
         """
@@ -244,32 +257,36 @@ class ArmService:
         """
         if not self.arm._initialized:
             return False
-        
-        # 构建批量写入参数: {servo_id: (position, speed, acc), ...}
-        positions = {}
-        
-        for joint_name, angle in joint_angles.items():
-            if joint_name not in self.arm.config.joint_ids:
-                continue
-            
-            # 限制角度范围
-            angle = self.arm._clamp_angle(joint_name, angle)
-            
-            # 获取舵机ID和目标位置
-            servo_id = self.arm.config.joint_ids[joint_name]
-            position = self.arm._angle_to_pos(angle)
-            
-            # 添加到批量写入字典
-            positions[servo_id] = (position, speed, self.arm.config.default_acc)
-            
-            # 更新缓存
-            self.arm._current_angles[joint_name] = angle
-        
-        if not positions:
-            return True
-        
-        # 批量写入所有舵机（只有一次串口通信）
-        return self.arm.bus.sync_write_positions(positions)
+
+        try:
+            # 构建批量写入参数: {servo_id: (position, speed, acc), ...}
+            positions = {}
+
+            for joint_name, angle in joint_angles.items():
+                if joint_name not in self.arm.config.joint_ids:
+                    continue
+
+                # 限制角度范围
+                angle = self.arm._clamp_angle(joint_name, angle)
+
+                # 获取舵机ID和目标位置
+                servo_id = self.arm.config.joint_ids[joint_name]
+                position = self.arm._angle_to_pos(angle)
+
+                # 添加到批量写入字典
+                positions[servo_id] = (position, speed, self.arm.config.default_acc)
+
+                # 更新缓存
+                self.arm._current_angles[joint_name] = angle
+
+            if not positions:
+                return True
+
+            # 批量写入所有舵机（只有一次串口通信）
+            return self.arm.bus.sync_write_positions(positions)
+        except Exception as e:
+            print(f"[ARM_SVC] [ERROR] 批量写入关节失败: {e}")
+            return False
     
     def _parse_request(self, data: Dict[str, Any]) -> Optional[ArmCommand]:
         """解析REQ请求数据"""
@@ -361,7 +378,7 @@ class ArmService:
                 try:
                     request_data = self._rep_socket.recv_json(flags=zmq.NOBLOCK)
                     cmd = self._parse_request(request_data)
-                    
+
                     if cmd is None:
                         response = ArmResponse(
                             success=False,
@@ -371,15 +388,29 @@ class ArmService:
                         )
                     else:
                         response = self._arbitrate(cmd)
-                    
+
                     self._rep_socket.send_json(asdict(response))
-                    
+
                 except zmq.Again:
                     with self._lock:
                         self._check_timeout()
                     time.sleep(0.001)
                     continue
-                    
+                except Exception as e:
+                    print(f"[ARM_SVC] [ERROR] 请求处理异常: {e}")
+                    # ZMQ REQ-REP 模式下必须回复，否则客户端会永久阻塞
+                    try:
+                        self._rep_socket.send_json({
+                            "success": False,
+                            "message": f"内部错误: {e}",
+                            "current_owner": self._current_owner or "none",
+                            "current_priority": self._current_priority,
+                            "joint_states": None
+                        })
+                    except Exception as send_err:
+                        print(f"[ARM_SVC] [ERROR] 发送错误响应失败: {send_err}")
+                    continue
+
         except KeyboardInterrupt:
             print("\n[ARM_SVC] 正在关闭...")
         finally:

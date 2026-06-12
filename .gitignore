@@ -78,6 +78,9 @@ secrets.json
 
 # solidworks模型文件
 *.SLDPRT
+
+# 抓取过程截图（体积大、临时生成）
+skills/homebot-skill/scripts/grab_captures/
 *.SLDASM
 
 # 模型权重文件

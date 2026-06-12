@@ -1,18 +1,26 @@
-"""火山引擎流式 TTS 客户端
+"""开放式 TTS 客户端
 
-提供流式语音合成功能，支持实时音频流输出
+支持多提供商流式语音合成：
+- volcano: 火山引擎 WebSocket TTS
+- minimax: MiniMax Speech 2.8 (OpenAI 兼容接口)
+
+未来接入新 provider 只需：
+1. 实现 TTSClient Protocol
+2. 在 get_tts_client() 工厂中注册
 """
 import asyncio
 import copy
 import json
+import typing
 import uuid
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Protocol
 
+import httpx
 import websockets
+from openai import AsyncOpenAI
 
 from common.logging import get_logger
 from configs.config import get_config
-from configs.secrets import require_secrets
 from services.speech_service.protocols import (
     EventType,
     MsgType,
@@ -28,14 +36,35 @@ from services.speech_service.protocols import (
 logger = get_logger(__name__)
 
 
+class TTSClient(Protocol):
+    """TTS 客户端协议接口
+
+    所有 TTS 提供商必须实现此接口，供 VoiceEngine 统一调用。
+    """
+    is_connected: bool
+
+    async def connect(self) -> bool:
+        """建立连接，返回是否成功"""
+        ...
+
+    async def disconnect(self) -> None:
+        """断开连接，释放资源"""
+        ...
+
+    async def synthesize(self, text: str) -> bytes:
+        """完整合成（一次性返回全部音频数据）"""
+        ...
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成（逐块返回音频数据）"""
+        ...
+
+
 class VolcanoTTSClient:
     """火山引擎流式 TTS 客户端"""
     
     def __init__(self):
-        """初始化 TTS 客户端"""
-        # 确保密钥已配置
-        require_secrets("tts")
-        
+        """初始化火山引擎 TTS 客户端"""
         tts_config = get_config().tts
         self.appid = tts_config.appid
         self.access_token = tts_config.access_token
@@ -43,11 +72,11 @@ class VolcanoTTSClient:
         self.voice_type = tts_config.voice_type
         self.encoding = tts_config.encoding
         self.endpoint = tts_config.endpoint
-        
+
         self.websocket = None
         self.session_id = None
         self.is_connected = False
-    
+
     def _get_resource_id(self) -> str:
         """获取资源 ID"""
         if self.resource_id:
@@ -55,10 +84,10 @@ class VolcanoTTSClient:
         if self.voice_type.startswith("S_"):
             return "volc.megatts.default"
         return "volc.service_type.10029"
-    
+
     async def connect(self) -> bool:
-        """连接到火山引擎 TTS 服务器
-        
+        """连接到火山引擎 TTS 服务器并启动会话
+
         Returns:
             bool: 连接是否成功
         """
@@ -69,46 +98,26 @@ class VolcanoTTSClient:
                 "X-Api-Resource-Id": self._get_resource_id(),
                 "X-Api-Connect-Id": str(uuid.uuid4()),
             }
-            
+
             logger.info(f"正在连接到火山引擎 TTS 服务器...")
             self.websocket = await websockets.connect(
-                self.endpoint, 
-                additional_headers=headers, 
+                self.endpoint,
+                additional_headers=headers,
                 max_size=10 * 1024 * 1024
             )
-            
+
             logid = self.websocket.response.headers.get('x-tt-logid', 'unknown')
             logger.info(f"连接成功, Logid: {logid}")
-            
+
             # 启动连接
             await start_connection(self.websocket)
             await wait_for_event(
                 self.websocket, MsgType.FullServerResponse, EventType.ConnectionStarted
             )
-            
-            self.is_connected = True
-            return True
-            
-        except Exception as e:
-            logger.error(f"连接火山引擎 TTS 服务器失败: {e}")
-            self.is_connected = False
-            return False
-    
-    async def start_session(self) -> bool:
-        """启动 TTS 会话
-        
-        Returns:
-            bool: 会话是否启动成功
-        """
-        if not self.websocket:
-            logger.error("WebSocket 未连接")
-            return False
-            
-        try:
+
+            # 启动会话
             base_request = {
-                "user": {
-                    "uid": str(uuid.uuid4()),
-                },
+                "user": {"uid": str(uuid.uuid4())},
                 "namespace": "BidirectionalTTS",
                 "req_params": {
                     "speaker": self.voice_type,
@@ -122,26 +131,26 @@ class VolcanoTTSClient:
                     }),
                 },
             }
-            
             start_session_request = copy.deepcopy(base_request)
             start_session_request["event"] = EventType.StartSession
             self.session_id = str(uuid.uuid4())
-            
+
             await start_session(
-                self.websocket, 
-                json.dumps(start_session_request).encode(), 
+                self.websocket,
+                json.dumps(start_session_request).encode(),
                 self.session_id
             )
-            
             await wait_for_event(
                 self.websocket, MsgType.FullServerResponse, EventType.SessionStarted
             )
-            
+
             logger.info(f"TTS 会话启动成功, Session ID: {self.session_id}")
+            self.is_connected = True
             return True
-            
+
         except Exception as e:
-            logger.error(f"启动 TTS 会话失败: {e}")
+            logger.error(f"连接火山引擎 TTS 服务器失败: {e}")
+            self.is_connected = False
             return False
     
     async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
@@ -212,25 +221,23 @@ class VolcanoTTSClient:
     
     async def synthesize(self, text: str) -> bytes:
         """完整合成语音（一次性返回所有音频数据）
-        
+
         Args:
             text: 要合成的文本
-            
+
         Returns:
             bytes: 完整的音频数据
         """
-        if not await self.connect():
-            return b""
-        
-        if not await self.start_session():
-            return b""
-        
+        if not self.is_connected:
+            if not await self.connect():
+                return b""
+
         audio_chunks = []
         async for chunk in self.synthesize_stream(text):
             audio_chunks.append(chunk)
-        
+
         await self.disconnect()
-        
+
         return b"".join(audio_chunks)
     
     async def disconnect(self):
@@ -249,36 +256,148 @@ class VolcanoTTSClient:
     async def __aenter__(self):
         """异步上下文管理器入口"""
         await self.connect()
-        await self.start_session()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器退出"""
         await self.disconnect()
 
 
+class MiniMaxTTSClient:
+    """MiniMax Speech 2.8 TTS 客户端（原生 HTTP /v1/t2a_v2 接口）"""
+
+    def __init__(self):
+        """初始化 MiniMax TTS 客户端"""
+        tts_config = get_config().tts
+        self.api_key = tts_config.api_key
+        self.api_url = tts_config.api_url or "https://api.minimax.chat/v1"
+        self.model = tts_config.model or "speech-2.8-hd"
+        self.voice_id = tts_config.voice_type or "Chinese (Mandarin)_Gentle_Senior"
+        self.audio_format = tts_config.encoding or "pcm"
+        self.sample_rate = tts_config.sample_rate or 16000
+        self.is_connected = True  # HTTP 无需显式连接
+
+    async def connect(self) -> bool:
+        """HTTP 无需显式连接"""
+        return True
+
+    async def disconnect(self) -> None:
+        """HTTP 无需显式断开"""
+        pass
+
+    async def synthesize_stream(self, text: str) -> AsyncGenerator[bytes, None]:
+        """流式合成语音（MiniMax 原生 t2a_v2 接口）
+
+        当前使用非流式请求，一次性返回完整音频后分块 yield，
+        保证与 VoiceEngine 的流式播放接口兼容。
+
+        Args:
+            text: 要合成的文本
+
+        Yields:
+            bytes: 音频数据块
+        """
+        try:
+            logger.info(f"MiniMax TTS 合成: {text}")
+            url = f"{self.api_url.rstrip('/')}/t2a_v2"
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": self.model,
+                "text": text,
+                "stream": False,
+                "voice_setting": {
+                    "voice_id": self.voice_id,
+                    "speed": 1,
+                    "vol": 1,
+                    "pitch": 0,
+                },
+                "audio_setting": {
+                    "sample_rate": self.sample_rate,
+                    "format": self.audio_format,
+                    "channel": 1,
+                },
+            }
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                result = response.json()
+
+            hex_audio = result.get("data", {}).get("audio", "")
+            if not hex_audio:
+                logger.warning("MiniMax TTS 返回空音频")
+                return
+
+            audio_bytes = bytes.fromhex(hex_audio)
+            # 分块 yield，模拟流式效果，与 VoiceEngine 兼容
+            chunk_size = 4096
+            for i in range(0, len(audio_bytes), chunk_size):
+                yield audio_bytes[i:i + chunk_size]
+
+            extra = result.get("extra_info", {})
+            logger.info(
+                f"MiniMax TTS 完成: {len(audio_bytes)} 字节, "
+                f"采样率 {extra.get('audio_sample_rate', 'unknown')}, "
+                f"字数 {extra.get('usage_characters', 'unknown')}"
+            )
+        except Exception as e:
+            logger.error(f"MiniMax TTS 合成失败: {e}")
+            raise
+
+    async def synthesize(self, text: str) -> bytes:
+        """完整合成语音（一次性返回所有音频数据）
+
+        Args:
+            text: 要合成的文本
+
+        Returns:
+            bytes: 完整的音频数据
+        """
+        chunks = []
+        async for chunk in self.synthesize_stream(text):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
 # 全局 TTS 客户端实例
-_tts_client: Optional[VolcanoTTSClient] = None
+_tts_client: Optional[TTSClient] = None
 
 
-async def get_tts_client() -> VolcanoTTSClient:
-    """获取全局 TTS 客户端实例
-    
+async def get_tts_client() -> TTSClient:
+    """获取全局 TTS 客户端实例（工厂模式）
+
+    根据 config.tts.provider 自动创建对应提供商的客户端。
+
     Returns:
-        VolcanoTTSClient: TTS 客户端实例
+        TTSClient: TTS 客户端实例
     """
     global _tts_client
     if _tts_client is None:
-        _tts_client = VolcanoTTSClient()
+        config = get_config().tts
+        logger.info(f"TTS Provider: {config.provider}")
+        if config.provider == "volcano":
+            _tts_client = VolcanoTTSClient()
+        elif config.provider == "minimax":
+            _tts_client = MiniMaxTTSClient()
+        else:
+            raise ValueError(f"未知的 TTS 提供商: {config.provider}")
     return _tts_client
 
 
 async def tts_synthesize_stream(text: str) -> AsyncGenerator[bytes, None]:
     """流式 TTS 合成接口
-    
+
     Args:
         text: 要合成的文本
-        
+
     Yields:
         bytes: 音频数据块
     """
@@ -286,19 +405,17 @@ async def tts_synthesize_stream(text: str) -> AsyncGenerator[bytes, None]:
     if not client.is_connected:
         if not await client.connect():
             return
-        if not await client.start_session():
-            return
-    
+
     async for chunk in client.synthesize_stream(text):
         yield chunk
 
 
 async def tts_synthesize(text: str) -> bytes:
     """完整 TTS 合成接口
-    
+
     Args:
         text: 要合成的文本
-        
+
     Returns:
         bytes: 完整的音频数据
     """
@@ -309,8 +426,8 @@ async def tts_synthesize(text: str) -> bytes:
 
 
 def tts_to_file(text: str, audio_file: str) -> None:
-    """将文本转换为mp3音频文件
-    
+    """将文本转换为音频文件
+
     Args:
         text: 要合成的文本
         audio_file: 输出音频文件路径
@@ -322,7 +439,7 @@ def tts_to_file(text: str, audio_file: str) -> None:
 
 async def tts_connect() -> bool:
     """建立 TTS 连接
-    
+
     Returns:
         bool: 连接是否成功
     """

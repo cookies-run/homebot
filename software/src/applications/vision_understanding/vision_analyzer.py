@@ -24,18 +24,24 @@ import cv2
 import numpy as np
 from services.vision_service.vision import VisionSubscriber
 from common.logging import get_logger
-from configs.secrets import get_secrets, require_secrets
+from configs.secrets import get_secrets
 
 logger = get_logger(__name__)
 
 # 默认火山引擎配置
-DEFAULT_ARK_MODEL = "doubao-seed-2-0-mini-260215"
+DEFAULT_ARK_MODEL = "doubao-vision-lite-250225"
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+
+# 默认 MiniMax 配置
+DEFAULT_MINIMAX_API_HOST = "https://api.minimaxi.com"
 
 
 class VisionAnalyzer:
-    """视觉分析器 - 捕获视频帧并进行 AI 分析"""
-    
+    """视觉分析器 - 捕获视频帧并进行 AI 分析
+
+    支持多提供商：MiniMax / 火山Ark，通过 VISION_PROVIDER 环境变量切换。
+    """
+
     def __init__(
         self,
         video_addr: str = "tcp://localhost:5560",
@@ -45,44 +51,57 @@ class VisionAnalyzer:
         timeout_ms: int = 5000
     ):
         """初始化视觉分析器
-        
+
         Args:
             video_addr: VisionService PUB 地址
-            api_key: 火山引擎 API Key，默认从环境变量或 .env.local 获取
-            model: 模型 ID，默认使用 doubao-vision-lite-250225
-            base_url: Ark API 基础 URL
+            api_key: 兼容参数，根据 provider 解释
+            model: 模型 ID
+            base_url: API 基础 URL
             timeout_ms: 视频帧获取超时（毫秒）
         """
         self.video_addr = video_addr
         self.timeout_ms = timeout_ms
-        
-        # 加载密钥配置（优先使用传入的参数，其次环境变量，最后secrets模块）
+
+        # 提供商选择
+        self.provider = os.getenv("VISION_PROVIDER", "minimax")
         secrets = get_secrets()
-        
-        # API Key: 参数 > 环境变量 > secrets模块
-        self.api_key = api_key or os.getenv("ARK_API_KEY", "")
-        if not self.api_key and secrets.vision.api_key:
-            self.api_key = secrets.vision.api_key
-        # 如果vision没有单独配置，尝试使用火山TTS的appid+token（部分Ark服务支持）
-        if not self.api_key and secrets.tts.access_token:
-            self.api_key = secrets.tts.access_token
-        
-        # 模型ID
-        self.model = model or os.getenv("ARK_MODEL_ID", DEFAULT_ARK_MODEL)
-        
-        # API基础URL
-        self.base_url = base_url or os.getenv("ARK_BASE_URL", DEFAULT_ARK_BASE_URL)
-        # 如果配置了自定义的vision URL，使用它
+
+        # ---------- MiniMax 配置 ----------
+        self.minimax_api_key = api_key or os.getenv("MINIMAX_API_KEY", "")
+        if not self.minimax_api_key:
+            self.minimax_api_key = secrets.llm.api_key  # 复用 LLM Key
+        self.minimax_api_host = base_url or os.getenv("MINIMAX_API_HOST", "")
+        if not self.minimax_api_host and secrets.llm.api_url:
+            # 从 LLM_API_URL 提取 host，例如 https://api.minimax.chat/v1 -> https://api.minimax.chat
+            from urllib.parse import urlparse
+            parsed = urlparse(secrets.llm.api_url)
+            self.minimax_api_host = f"{parsed.scheme}://{parsed.netloc}"
+        if not self.minimax_api_host:
+            self.minimax_api_host = DEFAULT_MINIMAX_API_HOST
+        self.minimax_api_host = self.minimax_api_host.rstrip("/")
+
+        # ---------- 火山 Ark 配置 ----------
+        self.ark_api_key = api_key or os.getenv("ARK_API_KEY", "")
+        if not self.ark_api_key and secrets.vision.api_key:
+            self.ark_api_key = secrets.vision.api_key
+        if not self.ark_api_key and secrets.tts.access_token:
+            self.ark_api_key = secrets.tts.access_token
+
+        self.ark_model = model or os.getenv("ARK_MODEL_ID", DEFAULT_ARK_MODEL)
+        self.ark_base_url = base_url or os.getenv("ARK_BASE_URL", DEFAULT_ARK_BASE_URL)
         if secrets.vision.api_url:
-            self.base_url = secrets.vision.api_url
-        
+            self.ark_base_url = secrets.vision.api_url
+
         # 视频订阅器
         self._subscriber: Optional[VisionSubscriber] = None
-        
+
         # 临时目录
         self._temp_dir = tempfile.mkdtemp(prefix="homebot_vision_")
-        
-        logger.info(f"VisionAnalyzer initialized, video_addr={video_addr}")
+
+        logger.info(
+            f"VisionAnalyzer initialized, provider={self.provider}, "
+            f"video_addr={video_addr}"
+        )
     
     def _ensure_subscriber(self) -> VisionSubscriber:
         """确保视频订阅器已启动
@@ -153,28 +172,126 @@ class VisionAnalyzer:
         prompt: str = "请描述这张图片的内容",
         max_tokens: int = 4096
     ) -> Dict[str, Any]:
-        """调用火山引擎 LLM 分析图片
-        
+        """分析图片内容
+
+        根据配置的 provider 自动选择 MiniMax 或火山 Ark。
+
         Args:
             image_path: 图片文件路径
             prompt: 对图片的提问或指令
-            max_tokens: 最大输出 token 数
-            
+            max_tokens: 最大输出 token 数（Ark 专用）
+
         Returns:
             包含状态和结果的字典
         """
-        if not self.api_key:
-            return {
-                "status": "error",
-                "message": "API Key 未配置，请设置 ARK_API_KEY 环境变量，或在 .env.local 中配置 VISION_API_KEY 或 VOLCANO_ACCESS_TOKEN"
-            }
-        
         if not os.path.exists(image_path):
             return {
                 "status": "error",
                 "message": f"图片文件不存在: {image_path}"
             }
-        
+
+        if self.provider == "minimax":
+            return self._analyze_minimax(image_path, prompt)
+        else:
+            return self._analyze_ark(image_path, prompt, max_tokens)
+
+    def _create_minimax_image_url(self, image_path: str) -> str:
+        """创建 MiniMax 支持的 image_url 格式"""
+        if image_path.startswith(("http://", "https://")):
+            return image_path
+        ext = os.path.splitext(image_path)[1].lower()
+        mime_types = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+        }
+        mime_type = mime_types.get(ext, "image/jpeg")
+        b64 = self.encode_image(image_path)
+        return f"data:{mime_type};base64,{b64}"
+
+    def _analyze_minimax(
+        self,
+        image_path: str,
+        prompt: str
+    ) -> Dict[str, Any]:
+        """调用 MiniMax VLM 分析图片
+
+        使用原生 /v1/coding_plan/vlm 端点。
+        """
+        if not self.minimax_api_key:
+            return {
+                "status": "error",
+                "message": "MiniMax API Key 未配置，请在 .env.local 中设置 LLM_API_KEY 或 MINIMAX_API_KEY"
+            }
+
+        try:
+            import requests
+        except ImportError:
+            return {
+                "status": "error",
+                "message": "未安装 requests"
+            }
+
+        try:
+            image_url = self._create_minimax_image_url(image_path)
+            url = f"{self.minimax_api_host}/v1/coding_plan/vlm"
+            headers = {
+                "Authorization": f"Bearer {self.minimax_api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "prompt": prompt,
+                "image_url": image_url,
+            }
+
+            logger.info(f"Sending analysis request to MiniMax VLM, host={self.minimax_api_host}")
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            base_resp = data.get("base_resp", {})
+            status_code = base_resp.get("status_code", -1)
+            if status_code != 0:
+                status_msg = base_resp.get("status_msg", "unknown error")
+                raise RuntimeError(f"MiniMax API 错误 [{status_code}]: {status_msg}")
+
+            result_text = data.get("content", "")
+            logger.info("MiniMax VLM analysis completed successfully")
+
+            return {
+                "status": "success",
+                "description": result_text,
+                "image_path": image_path
+            }
+
+        except Exception as e:
+            logger.error(f"MiniMax VLM analysis failed: {e}")
+            return {
+                "status": "error",
+                "message": f"图像分析失败: {e}"
+            }
+
+    def _analyze_ark(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 4096
+    ) -> Dict[str, Any]:
+        """调用火山引擎 Ark LLM 分析图片
+
+        Args:
+            image_path: 图片文件路径
+            prompt: 对图片的提问或指令
+            max_tokens: 最大输出 token 数
+
+        Returns:
+            包含状态和结果的字典
+        """
+        if not self.ark_api_key:
+            return {
+                "status": "error",
+                "message": "Ark API Key 未配置，请设置 ARK_API_KEY 环境变量，或在 .env.local 中配置 VISION_API_KEY 或 VOLCANO_ACCESS_TOKEN"
+            }
+
         try:
             # 尝试导入火山引擎 SDK
             try:
@@ -184,13 +301,13 @@ class VisionAnalyzer:
                     "status": "error",
                     "message": "未安装 volcenginesdkarkruntime，请运行: pip install volcenginesdkarkruntime"
                 }
-            
+
             # 初始化客户端
-            client = Ark(base_url=self.base_url, api_key=self.api_key)
-            
+            client = Ark(base_url=self.ark_base_url, api_key=self.ark_api_key)
+
             # 编码图片
             base64_image = self.encode_image(image_path)
-            
+
             # 构建消息内容
             content = [
                 {"type": "text", "text": prompt},
@@ -201,27 +318,27 @@ class VisionAnalyzer:
                     }
                 }
             ]
-            
+
             # 发送请求
-            logger.info(f"Sending analysis request to Ark LLM, model={self.model}")
+            logger.info(f"Sending analysis request to Ark LLM, model={self.ark_model}")
             response = client.chat.completions.create(
-                model=self.model,
+                model=self.ark_model,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=max_tokens,
                 stream=False
             )
-            
+
             result_text = response.choices[0].message.content
-            logger.info("Analysis completed successfully")
-            
+            logger.info("Ark analysis completed successfully")
+
             return {
                 "status": "success",
                 "description": result_text,
                 "image_path": image_path
             }
-            
+
         except Exception as e:
-            logger.error(f"Analysis failed: {e}")
+            logger.error(f"Ark analysis failed: {e}")
             return {
                 "status": "error",
                 "message": f"图像分析失败: {e}"

@@ -20,6 +20,24 @@ from configs.config import get_config
 
 logger = get_logger(__name__)
 
+# ---------- 导入 AutoGrabWorkflow（视觉引导抓取）----------
+# skills/homebot-skill/scripts 相对路径: software/src/applications/speech_interaction/
+# -> ../../../../skills/homebot-skill/scripts
+_skills_scripts_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "../../../../skills/homebot-skill/scripts"
+)
+if os.path.exists(_skills_scripts_path):
+    sys.path.insert(0, _skills_scripts_path)
+
+try:
+    from auto_grab_workflow import AutoGrabWorkflow
+    _AUTO_GRAB_AVAILABLE = True
+    logger.info("AutoGrabWorkflow 导入成功")
+except ImportError as e:
+    _AUTO_GRAB_AVAILABLE = False
+    logger.warning(f"AutoGrabWorkflow 导入失败: {e}")
+
 # 创建全局 FastMCP 服务器实例
 mcp = FastMCP("HomeBot Voice Interaction MCP Server")
 
@@ -1149,6 +1167,66 @@ def release_object(gripper_angle: float = 90.0) -> dict:
         return {"status": "error", "message": str(e)}
 
 
+@mcp.tool
+def auto_grab(target_object: str = "物体", use_end_camera: bool = False) -> dict:
+    """自主视觉引导抓取指定物品
+
+    机器人会使用摄像头观察环境，识别目标物品位置，
+    调整机械臂姿态和底盘位置，然后执行抓取。
+
+    与 grab_object 的区别：
+    - auto_grab: 有视觉引导，自动寻找并对准目标后抓取
+    - grab_object: 盲抓取，直接闭合夹爪，不观察目标
+
+    当用户说"帮我拿那个苹果"、"把桌上的纸巾抓起来"等需要识别和定位的指令时，
+    应该调用此工具，而不是 grab_object。
+
+    Args:
+        target_object: 要抓取的目标物品描述，例如"红色苹果"、"一包纸巾"
+        use_end_camera: 是否使用机械臂末端摄像头进行精确对准（默认False，使用机身摄像头即可）
+
+    Returns:
+        抓取结果
+    """
+    if not _AUTO_GRAB_AVAILABLE:
+        return {
+            "status": "error",
+            "message": "AutoGrabWorkflow 不可用，请检查 skills/homebot-skill/scripts 依赖"
+        }
+
+    try:
+        cfg = get_config()
+        arm_addr = cfg.zmq.arm_service_addr.replace("*", "localhost")
+        arm_port = int(arm_addr.split(":")[-1])
+
+        workflow = AutoGrabWorkflow(
+            robot_ip="127.0.0.1",
+            video_port=5560,        # 机身主摄像头（Phase 1 底盘粗定位用）
+            end_video_port=5561,    # 机械臂末端摄像头（Phase 2 精对准用）
+            arm_port=arm_port,
+            max_attempts=8,
+            use_end_camera=use_end_camera,
+        )
+        result = workflow.run(target_object=target_object)
+
+        if result.get("success"):
+            return {
+                "status": "success",
+                "message": f"已成功抓取: {target_object}。{result.get('message', '')}"
+            }
+        else:
+            return {
+                "status": "error",
+                "message": f"抓取失败: {result.get('message', '未知原因')}"
+            }
+    except Exception as e:
+        logger.error(f"auto_grab 执行失败: {e}")
+        return {
+            "status": "error",
+            "message": f"自主抓取异常: {e}"
+        }
+
+
 # 机械臂运动学实例（从配置读取连杆长度）
 _arm_kinematics = None
 
@@ -2059,8 +2137,29 @@ class MCPClientWrapper:
                 "type": "function",
                 "function": {
                     "name": "grab_object",
-                    "description": "控制机械臂执行抓取动作",
+                    "description": "控制机械臂执行抓取动作（盲抓取，直接闭合夹爪，不观察目标）。仅当用户明确要求'闭合夹爪'或'夹紧'时调用",
                     "parameters": {"type": "object", "properties": {}}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "auto_grab",
+                    "description": "自主视觉引导抓取指定物品。机器人会使用摄像头观察环境、识别目标位置、调整机械臂姿态和底盘位置，然后执行抓取。当用户说'帮我拿那个苹果'、'把桌上的纸巾抓起来'、'抓起面前的物体'等需要识别和定位的指令时，必须调用此工具而不是 grab_object",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "target_object": {
+                                "type": "string",
+                                "description": "要抓取的目标物品描述，例如'红色苹果'、'一包纸巾'、'桌上的矿泉水瓶'"
+                            },
+                            "use_end_camera": {
+                                "type": "boolean",
+                                "description": "是否使用机械臂末端摄像头进行精确对准，默认false"
+                            }
+                        },
+                        "required": ["target_object"]
+                    }
                 }
             },
             {
@@ -2205,6 +2304,7 @@ class MCPClientWrapper:
             "get_robot_status": get_robot_status,
             "get_battery_status": get_battery_status,
             "grab_object": grab_object,
+            "auto_grab": auto_grab,
             "release_object": release_object,
             "hold_object": hold_object,
             "reset_arm": reset_arm,

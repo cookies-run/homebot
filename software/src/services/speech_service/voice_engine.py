@@ -60,18 +60,27 @@ class VoiceEngine:
         self.in_listening_mode = False
         self.last_speech_time = 0
         self.current_text = ""
-        
+
+        # 模拟唤醒冷却（避免模型缺失时频繁误触发）
+        self._simulated_wakeup_cooldown = 5.0  # 秒
+        self._last_simulated_wakeup_time = 0.0
+
         # 麦克风相关（仅 full 模式）
-        self.mic_index = self.speech_config.mic_index
+        # 优先使用设备名称（mic_name）匹配，找不到再回退到索引（mic_index）
+        mic_name = getattr(self.speech_config, 'mic_name', None)
+        if mic_name:
+            self.mic_index = self._resolve_mic_index_by_name(mic_name)
+        else:
+            self.mic_index = self.speech_config.mic_index
         self.mic_stream = None
         self.samples_per_read = int(0.1 * self.sample_rate)  # 0.1秒
-        
+
         # TTS相关
         self.tts_connected = False
-        self.tts_sample_rate = 16000  # 火山引擎 TTS 输出采样率
+        self.tts_sample_rate = config.tts.sample_rate  # 从配置读取采样率
         self.tts_channels = 1
         self.tts_bytes_per_sample = 2  # 16-bit PCM
-        
+
         # 音频播放相关
         self.audio_stream = sd.OutputStream(
             channels=self.tts_channels,
@@ -79,12 +88,43 @@ class VoiceEngine:
             dtype="int16",
             blocksize=2048
         )
-        
+
         if mode == "tts_only":
             self._initialize_tts_only()
         else:
             self._initialize()
-    
+
+    def _resolve_mic_index_by_name(self, name_pattern: str) -> int:
+        """根据设备名称查找 sounddevice 麦克风索引
+
+        按名称匹配可以避免设备插拔后索引变化的问题。
+
+        Args:
+            name_pattern: 设备名称或名称中的关键词（不区分大小写）
+
+        Returns:
+            sounddevice 设备索引，未找到时回退到 mic_index 配置
+        """
+        if not name_pattern:
+            return self.speech_config.mic_index
+
+        pattern = name_pattern.lower()
+        try:
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                if dev.get('max_input_channels', 0) > 0:
+                    dev_name = dev.get('name', '').lower()
+                    if pattern in dev_name:
+                        logger.info(f"麦克风名称匹配: '{name_pattern}' -> 索引 {i} ({dev.get('name')})")
+                        return i
+            logger.warning(
+                f"未找到麦克风设备名称包含 '{name_pattern}'，"
+                f"回退到索引 {self.speech_config.mic_index}"
+            )
+        except Exception as e:
+            logger.error(f"查询麦克风设备失败: {e}")
+        return self.speech_config.mic_index
+
     def _initialize_tts_only(self):
         """仅初始化 TTS 相关资源（轻量级模式）"""
         logger.info("语音引擎以 TTS-only 模式初始化")
@@ -198,11 +238,15 @@ class VoiceEngine:
             return False
         
         try:
-            # 如果没有加载真实模型，使用模拟唤醒
+            # 如果没有加载真实模型，使用模拟唤醒（带冷却，避免频繁误触发）
             if not self.wakeup_detector:
                 import random
-                is_wakeup = random.random() < 0.1
+                current_time = time.time()
+                if current_time - self._last_simulated_wakeup_time < self._simulated_wakeup_cooldown:
+                    return False
+                is_wakeup = random.random() < 0.005  # 0.5% 概率，大幅降低误触发
                 if is_wakeup:
+                    self._last_simulated_wakeup_time = current_time
                     logger.info(f"[模拟] 检测到唤醒词: {self.wakeup_keyword}")
                 return is_wakeup
             
@@ -244,10 +288,14 @@ class VoiceEngine:
             return False
         except Exception as e:
             logger.error(f"语音唤醒检测失败: {e}")
-            # 降级为模拟唤醒
+            # 降级为模拟唤醒（带冷却，避免频繁误触发）
             import random
-            is_wakeup = random.random() < 0.1
+            current_time = time.time()
+            if current_time - self._last_simulated_wakeup_time < self._simulated_wakeup_cooldown:
+                return False
+            is_wakeup = random.random() < 0.005  # 0.5% 概率，大幅降低误触发
             if is_wakeup:
+                self._last_simulated_wakeup_time = current_time
                 logger.info(f"[模拟] 检测到唤醒词: {self.wakeup_keyword}")
             return is_wakeup
     
@@ -266,29 +314,44 @@ class VoiceEngine:
                 logger.warning("未处于聆听模式，无法进行ASR识别")
                 return ""
 
+            start_time = time.time()
+            max_listen_time = 10.0  # 最大聆听总时长（秒）
+            speech_start_timeout = 5.0  # 等待语音开始的超时（秒）
+
             while True:
                 # 读取音频数据
                 samples, _ = self.mic_stream.read(self.samples_per_read)
                 samples = samples.reshape(-1)
-                
+
                 current_time = time.time()
                 self.asr_stream.accept_waveform(self.sample_rate, samples)
-                
+
                 # 解码音频
                 while self.asr_recognizer.is_ready(self.asr_stream):
                     self.asr_recognizer.decode_stream(self.asr_stream)
-                
+
                 # 获取当前识别结果
                 result = self.asr_recognizer.get_result(self.asr_stream)
                 if result != self.current_text:
                     self.current_text = result
                     self.last_speech_time = current_time
                     logger.info(f"正在识别: {self.current_text}")
-                
+
                 # 检查超时
                 if result and current_time - self.last_speech_time > self.listen_timeout:
                     break
-                
+
+                # 总超时保护：防止 ASR 始终无结果导致死循环
+                elapsed = current_time - start_time
+                if elapsed > max_listen_time:
+                    logger.warning(f"聆听总超时 ({max_listen_time}s)，退出识别")
+                    break
+
+                # 语音开始超时：长时间没识别到任何文字，提前退出
+                if not self.current_text and elapsed > speech_start_timeout:
+                    logger.warning(f"未检测到语音输入 ({speech_start_timeout}s)，退出识别")
+                    break
+
                 time.sleep(0.01)
             
             final_result = self.current_text
@@ -340,28 +403,21 @@ class VoiceEngine:
     
     async def synthesize(self, text: str) -> None:
         """TTS文本转语音（异步接口）
-        
+
+        支持多提供商（火山引擎 / MiniMax 等），配置缺失或失败时自动降级为模拟 TTS。
+
         Args:
             text: 需要合成的文本
         """
         if not text:
             logger.warning("TTS合成文本为空")
             return
-        
-        try:
-            # 使用模拟 TTS（如果没有配置真实 TTS）
-            tts_config = get_config().tts
-            if not self.tts_connected:
-                if not tts_config.appid:
-                    logger.info(f"[模拟TTS] {text}")
-                    return
-                self.tts_connected = True
-            
-            # 使用真实的流式 TTS
-            await self.synthesize_streaming(text)
 
+        try:
+            await self.synthesize_streaming(text)
         except Exception as e:
             logger.error(f"TTS合成失败: {e}")
+            logger.info(f"[模拟TTS] {text}")
     
     def play_audio_data(self, audio_data: bytes) -> None:
         """播放音频数据

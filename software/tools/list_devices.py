@@ -87,8 +87,16 @@ def list_cameras(test_open: bool = False) -> List[Dict[str, Any]]:
         print("   正在扫描摄像头设备...")
         found_any = False
         
+        # 选择正确的后端
+        if sys.platform == "win32":
+            backend = cv2.CAP_DSHOW
+        elif sys.platform == "darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_V4L2
+
         for index in range(10):
-            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2)
+            cap = cv2.VideoCapture(index, backend)
             if cap.isOpened():
                 found_any = True
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -111,7 +119,7 @@ def list_cameras(test_open: bool = False) -> List[Dict[str, Any]]:
                 print(f"      分辨率: {width}x{height}")
                 print(f"      帧率: {fps:.1f} fps" if fps > 0 else "      帧率: 未知")
                 print(f"      后端: {backend}")
-                
+
                 # 如果请求测试，显示预览
                 if test_open:
                     print(f"      正在测试预览，按 'q' 键继续...")
@@ -127,8 +135,8 @@ def list_cameras(test_open: bool = False) -> List[Dict[str, Any]]:
                             print(f"      ⚠️ 无法读取帧")
                             break
                     cv2.destroyAllWindows()
-                    
-            cap.release()
+
+                cap.release()
             
         if not found_any:
             print("   未找到摄像头设备")

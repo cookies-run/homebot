@@ -10,23 +10,27 @@
         set HOMEBOT_CHASSIS_PORT=5556
         set HOMEBOT_ARM_PORT=5557
         set HOMEBOT_VIDEO_PORT=5560
-    
+        set HOMEBOT_END_VIDEO_PORT=5561
+
     Linux/Mac:
         export HOMEBOT_IP=192.168.1.13
         export HOMEBOT_CHASSIS_PORT=5556
         export HOMEBOT_ARM_PORT=5557
         export HOMEBOT_VIDEO_PORT=5560
+        export HOMEBOT_END_VIDEO_PORT=5561
 """
 
 import os
 
 # 机器人IP地址 - 可通过 HOMEBOT_IP 环境变量覆盖
-ROBOT_IP = os.getenv("HOMEBOT_IP", "192.168.1.13")
+ROBOT_IP = os.getenv("HOMEBOT_IP", "127.0.0.1")
 
 # ZeroMQ 端口配置 - 可通过环境变量覆盖
+# 当前系统实际配置：5560=机身主摄像头，5561=机械臂末端摄像头
 CHASSIS_PORT = int(os.getenv("HOMEBOT_CHASSIS_PORT", "5556"))
 ARM_PORT = int(os.getenv("HOMEBOT_ARM_PORT", "5557"))
-VIDEO_PORT = int(os.getenv("HOMEBOT_VIDEO_PORT", "5560"))
+VIDEO_PORT = int(os.getenv("HOMEBOT_VIDEO_PORT", "5560"))          # 机身主摄像头
+END_VIDEO_PORT = int(os.getenv("HOMEBOT_END_VIDEO_PORT", "5561"))  # 机械臂末端摄像头
 
 # 捕获超时时间（秒）
 CAPTURE_TIMEOUT = float(os.getenv("HOMEBOT_CAPTURE_TIMEOUT", "10.0"))

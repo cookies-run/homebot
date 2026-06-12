@@ -14,7 +14,7 @@ import time
 from typing import Optional
 
 # Configuration - Modify this for your robot
-ROBOT_IP = "192.168.1.13"
+ROBOT_IP = "127.0.0.1"
 ROBOT_PORT = 5556
 DEFAULT_SPEED = 0.3       # m/s
 DEFAULT_ANGULAR_SPEED = 0.5  # rad/s

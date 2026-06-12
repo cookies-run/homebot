@@ -29,8 +29,8 @@ class CameraConfig:
 
     unique_id 是硬件级稳定标识，插拔不变；优先级：unique_id > device_name > device_id。
     """
-    device_id: int = 1   # OpenCV 设备索引（Linux/Windows 使用；macOS 仅作 fallback）
-    device_name: str = ""  # 按名称查找摄像头（例如 "USB摄像头"），非空时优先于 device_id
+    device_id: int = 0   # OpenCV 设备索引（Linux/Windows 使用；macOS 仅作 fallback）
+    device_name: str = "1080P USB Camera"  # 按名称查找摄像头（主摄像头），非空时优先于 device_id
     unique_id: str = ""    # macOS AVFoundation 稳定硬件标识（最优先）
     width: int = 1920     # 摄像头原始分辨率
     height: int = 1080
@@ -40,7 +40,7 @@ class CameraConfig:
 @dataclass
 class ArmConfig:
     """机械臂配置"""
-    serial_port: str = "COM23"  # 与底盘共用串口
+    serial_port: str = "auto"  # 与底盘共用串口，设为 "auto" 自动检测
     baudrate: int = 1000000
     # 舵机ID映射 (1-6号关节)
     base_id: int = 1
@@ -50,8 +50,8 @@ class ArmConfig:
     wrist_roll_id: int = 5
     gripper_id: int = 6
     # 连杆长度 (mm) 人工设置，AI勿动
-    upper_arm_length: float = 115.0  # 大臂长度 (L1)
-    forearm_length: float = 130.0    # 小臂长度 (L2)
+    upper_arm_length: float = 116.0  # 大臂长度 (L1) - 对应 CAD 图 shoulder→elbow
+    forearm_length: float = 135.0    # 小臂长度 (L2) - 对应 CAD 图 elbow→wrist_flex
     # 关节角度限制 (度) 人工设置，AI勿动
     joint_limits: dict = field(default_factory=lambda: {
         "base": (-180, 180),
@@ -78,8 +78,9 @@ class ArmConfig:
 @dataclass
 class ChassisConfig:
     """底盘配置 - 从机器人配置文件读取"""
-    # 串口配置（Windows: COM3, Linux: /dev/ttyUSB0）
-    serial_port: str = "COM23"
+    # 串口配置（Windows: COM3, Linux: /dev/ttyUSB0, macOS: /dev/tty.usbmodemxxx）
+    # 设为 "auto" 自动检测，或硬编码具体路径
+    serial_port: str = "auto"
     baudrate: int = 1000000
     
     # 舵机ID映射
@@ -138,7 +139,8 @@ class SpeechConfig:
     # 音频参数
     sample_rate: int = 16000
     channels: int = 1
-    mic_index: int = 1
+    mic_index: int = 1  # 整数索引，兼容旧配置；若 mic_name 为空则使用此索引
+    mic_name: str = "1080P USB Camera-Audio"  # 设备名称（优先），避免插拔后索引变化
     
     # 唤醒词配置
     wakeup_keyword: str = "你好小白"
@@ -150,50 +152,68 @@ class SpeechConfig:
 
 @dataclass
 class TTSConfig:
-    """火山引擎TTS配置
-    
-    敏感信息（appid, access_token）从 secrets 模块加载
-    如需修改，请在 .env.local 文件中设置
+    """TTS 配置（支持多提供商）
+
+    支持火山引擎(volcano)和 MiniMax 等开放式 TTS 提供商。
+    敏感信息从 secrets 模块加载，如需修改请在 .env.local 中设置。
     """
-    # 以下配置从环境变量/密钥管理加载
+    provider: str = "volcano"                 # 提供商: volcano / minimax / ...
+    # 火山引擎专用配置
     appid: str = ""                           # 应用ID
     access_token: str = ""                    # 访问令牌
     resource_id: str = "seed-tts-2.0"         # 资源ID
-    voice_type: str = "zh_female_vv_uranus_bigtts"  # 音色类型
-    encoding: str = "pcm"                     # 音频编码
     endpoint: str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+    # 通用配置（MiniMax 等也复用）
+    api_key: str = ""                         # 通用 API Key
+    api_url: str = ""                         # 通用 API 地址
+    model: str = ""                           # 通用模型名称
+    voice_type: str = "zh_female_vv_uranus_bigtts"  # 音色类型 / voice_id
+    encoding: str = "pcm"                     # 音频编码
     sample_rate: int = 16000                  # 输出采样率
-    
+
     def __post_init__(self):
         """从密钥管理加载敏感配置"""
-        if not self.appid or not self.access_token:
-            secrets = get_secrets()
-            if not self.appid:
-                self.appid = secrets.tts.appid
-            if not self.access_token:
-                self.access_token = secrets.tts.access_token
-            # 非敏感配置也可以从环境变量覆盖
-            if secrets.tts.resource_id:
-                self.resource_id = secrets.tts.resource_id
-            if secrets.tts.voice_type:
-                self.voice_type = secrets.tts.voice_type
+        import os
+        secrets = get_secrets()
+        # provider 支持从环境变量覆盖
+        env_provider = os.environ.get("TTS_PROVIDER")
+        if env_provider:
+            self.provider = env_provider
+        # 火山引擎密钥
+        if not self.appid:
+            self.appid = secrets.tts.appid
+        if not self.access_token:
+            self.access_token = secrets.tts.access_token
+        # 通用密钥（MiniMax 等）
+        if not self.api_key:
+            self.api_key = secrets.tts.api_key
+        if not self.api_url:
+            self.api_url = secrets.tts.api_url
+        if not self.model:
+            self.model = secrets.tts.model
+        # 非敏感配置也可以从环境变量覆盖
+        if secrets.tts.resource_id:
+            self.resource_id = secrets.tts.resource_id
+        if secrets.tts.voice_type:
+            self.voice_type = secrets.tts.voice_type
 
 
 @dataclass
 class LLMConfig:
     """LLM API配置
-    
+
     敏感信息（api_key）从 secrets 模块加载
+    支持火山Ark、DeepSeek、MiniMax 等 OpenAI 兼容接口
     如需修改，请在 .env.local 文件中设置
     """
-    provider: str = "volcano"                 # 提供商: volcano/deepseek/qwen
+    provider: str = "minimax"                 # 提供商: minimax/volcano/deepseek/qwen
     api_key: str = ""                         # API密钥
-    api_url: str = "https://ark.cn-beijing.volces.com/api/v3"  # API地址
-    model: str = ""                           # 模型名称（火山Ark需要填写模型ID，如 ep-20250324123456-abcdef）
+    api_url: str = "https://api.minimax.chat/v1"  # API地址
+    model: str = ""                           # 模型名称
     temperature: float = 0.1                  # 温度参数（低温度=更确定性回复，响应更快）
     max_tokens: int = 256                     # 最大token数（限制回复长度，提升速度）
     top_p: float = 0.9                        # 核采样（控制输出多样性）
-    
+
     def __post_init__(self):
         """从密钥管理加载敏感配置"""
         secrets = get_secrets()
@@ -206,7 +226,7 @@ class LLMConfig:
             self.model = secrets.llm.model
         # 如果没有配置model，给出警告
         if not self.model:
-            logger.warning("LLM模型未配置，请在.env.local中设置 ARK_MODEL_ID 或 LLM_MODEL")
+            logger.warning("LLM模型未配置，请在.env.local中设置 LLM_MODEL 或 ARK_MODEL_ID")
 
 
 @dataclass
@@ -296,7 +316,7 @@ class GamepadConfig:
 class HumanFollowConfig:
     """人体跟随配置（YOLO26版）"""
     # 模型配置
-    model_path: str = "models/yolo26n.onnx"     # YOLO26 nano (~2.4MB)
+    model_path: str = "models/yolo26n.pt"       # YOLO26 nano (~5.3MB)
     conf_threshold: float = 0.5               # 检测置信度阈值
     
     # 跟踪配置
@@ -390,11 +410,24 @@ class Config:
 _config_instance: Optional[Config] = None
 
 
+def _resolve_auto_ports(config: Config) -> None:
+    """解析串口配置中的 'auto' 值，调用自动检测"""
+    from common.platform_utils import resolve_auto_port
+
+    config.chassis.serial_port = resolve_auto_port(
+        config.chassis.serial_port, "chassis.serial_port"
+    )
+    config.arm.serial_port = resolve_auto_port(
+        config.arm.serial_port, "arm.serial_port"
+    )
+
+
 def get_config() -> Config:
     """获取全局配置实例"""
     global _config_instance
     if _config_instance is None:
         _config_instance = Config()
+        _resolve_auto_ports(_config_instance)
     return _config_instance
 
 

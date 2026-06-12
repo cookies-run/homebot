@@ -36,13 +36,17 @@ from video_subscriber import VideoSubscriber
 from datetime import datetime
 import robot_config as config
 
-# 尝试导入火山引擎视觉客户端
+# 尝试导入视觉客户端（优先 MiniMax，回退火山引擎）
 try:
-    from volcengine_vision_client import analyze_images
-    VOLCENGINE_AVAILABLE = True
+    from minimax_vision_client import analyze_images
+    VLM_PROVIDER = "minimax"
 except ImportError:
-    VOLCENGINE_AVAILABLE = False
-    print("[WARN] volcengine_vision_client 未找到，视觉分析功能不可用")
+    try:
+        from volcengine_vision_client import analyze_images
+        VLM_PROVIDER = "volcengine"
+    except ImportError:
+        VLM_PROVIDER = None
+        print("[WARN] 未找到视觉分析客户端（MiniMax 或火山引擎），视觉分析功能不可用")
 
 
 class WhatDoesRobotSeeWorkflow:
@@ -124,34 +128,36 @@ class WhatDoesRobotSeeWorkflow:
     
     def analyze(self, image_path: str) -> str:
         """
-        使用火山引擎 LLM 分析图片内容
-        
+        调用 VLM 分析图片内容（MiniMax 优先）
+
         Args:
             image_path: 图片文件路径
-            
+
         Returns:
             分析结果文本，失败返回 None
         """
-        if not VOLCENGINE_AVAILABLE:
-            print("[WARN] 火山引擎视觉分析模块不可用，跳过分析")
+        if not VLM_PROVIDER:
+            print("[WARN] 视觉分析模块不可用，跳过分析")
             return None
-        
+
         if not os.path.exists(image_path):
             print(f"[ERROR] 图片文件不存在: {image_path}")
             return None
-        
+
         try:
-            print(f"[INFO] 正在使用火山引擎分析图片...")
-            print(f"[INFO] 模型: {self.model}")
+            print(f"[INFO] 正在使用 {VLM_PROVIDER} 分析图片...")
             print(f"[INFO] 提示词: {self.prompt}")
-            
-            result = analyze_images(
-                image_paths=[image_path],
-                prompt=self.prompt,
-                model=self.model,
-                max_tokens=2048
-            )
-            
+
+            kwargs = {
+                "image_paths": [image_path],
+                "prompt": self.prompt,
+            }
+            if VLM_PROVIDER == "volcengine":
+                kwargs["model"] = self.model
+                kwargs["max_tokens"] = 2048
+
+            result = analyze_images(**kwargs)
+
             print(f"[OK] 分析完成")
             return result
         except Exception as e:
@@ -181,11 +187,11 @@ class WhatDoesRobotSeeWorkflow:
         result["success"] = True
         
         # 第二步：视觉分析（如果启用）
-        if self.enable_analysis and VOLCENGINE_AVAILABLE:
+        if self.enable_analysis and VLM_PROVIDER:
             analysis = self.analyze(image_path)
             result["analysis"] = analysis
-        elif self.enable_analysis and not VOLCENGINE_AVAILABLE:
-            print("[WARN] 视觉分析已启用但模块不可用，请安装 volcenginesdkarkruntime")
+        elif self.enable_analysis and not VLM_PROVIDER:
+            print("[WARN] 视觉分析已启用但模块不可用，请安装依赖")
         
         return result
 

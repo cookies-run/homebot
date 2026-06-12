@@ -281,14 +281,17 @@ if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
+
     logger.info("按 'q' 退出测试")
-    
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
+
+        # 水平翻转，解决 USB 摄像头镜像问题
+        frame = cv2.flip(frame, 1)
+
         # 检测并绘制
         output, detections = detector.detect_and_draw(frame)
         

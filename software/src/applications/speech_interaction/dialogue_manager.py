@@ -190,48 +190,78 @@ class DialogueManager:
             logger.error(f"LLM API调用异常: {e}")
             return {}
     
+    @staticmethod
+    def _clean_reply(reply: str) -> str:
+        """清理回复中的思考/推理内容，避免 TTS 读出思考过程
+
+        过滤规则：
+        - 去除 <think>...</think> 标签及其内容
+        - 去除 <thinking>...</thinking> 标签及其内容
+        - 去除 **思考：** 或 思考： 开头的段落
+
+        Args:
+            reply: 原始回复文本
+
+        Returns:
+            str: 清理后的回复文本
+        """
+        import re
+        if not reply:
+            return reply
+
+        # 去除 <think>...</think>（含换行）
+        reply = re.sub(r'<think>.*?</think>', '', reply, flags=re.DOTALL)
+        # 去除 <thinking>...</thinking>
+        reply = re.sub(r'<thinking>.*?</thinking>', '', reply, flags=re.DOTALL)
+        # 去除 **思考：**... 或 思考：... 开头的行/段落
+        reply = re.sub(r'\*\*思考：.*?\n', '\n', reply)
+        reply = re.sub(r'思考：.*?\n', '\n', reply)
+        # 去除连续空行并 strip
+        reply = re.sub(r'\n{2,}', '\n', reply).strip()
+        return reply
+
     async def process_query(self, text: str, context: dict = None) -> AsyncGenerator[tuple[str, dict], None]:
         """处理用户查询
-        
+
         Args:
             text: 用户输入文本
             context: 对话上下文（可选）
-        
+
         Yields:
             tuple: (回复文本, 更新后的上下文)
         """
         if not text:
             yield "抱歉，我没听清，请再说一遍", self.context
             return
-        
+
         # 确保 MCP 客户端已初始化
         if not self._mcp_initialized:
             await self._initialize_mcp_client()
-        
+
         current_context = context or self.context
-        
+
         try:
             # 构建对话历史
             messages = [
                 {"role": "system", "content": self.system_prompt}
             ]
-            
+
             # 添加历史对话
             for msg in current_context["history"]:
                 messages.append(msg)
-            
+
             # 添加当前用户输入
             messages.append({"role": "user", "content": text})
-            
+
             # 调用 LLM API
             response = self._call_llm_api(messages)
-            
+
             if not response or "choices" not in response:
                 yield "抱歉，我没听清，请再说一遍", current_context
                 return
-            
+
             llm_message = response["choices"][0]["message"]
-            logger.info(f"LLM回复: {llm_message.get('content', '无内容')}")
+            logger.info(f"LLM原始回复: {llm_message.get('content', '无内容')}")
 
             # 处理工具调用
             if llm_message.get("tool_calls"):
@@ -241,8 +271,8 @@ class DialogueManager:
                 # 否则给一个默认的"好的"响应
                 initial_reply = llm_message.get("content", "")
                 if initial_reply and initial_reply.strip() and initial_reply.strip() != "None":
-                    # LLM已经生成了回复（如"好的"），先播报给用户
-                    yield initial_reply, current_context
+                    # LLM已经生成了回复（如"好的"），先播报给用户（过滤思考内容）
+                    yield self._clean_reply(initial_reply), current_context
                 else:
                     # LLM没有生成回复内容，我们给一个默认的"好的"
                     yield "好的", current_context
@@ -295,19 +325,22 @@ class DialogueManager:
             else:
                 # 没有工具调用，直接使用 LLM 回复
                 reply = llm_message.get("content", "抱歉，我没听清，请再说一遍")
-            
+
+            # 过滤思考内容，避免 TTS 读出推理过程
+            reply = self._clean_reply(reply)
+
             # 更新对话历史
             current_context["history"].append({"role": "user", "content": text})
             current_context["history"].append({"role": "assistant", "content": reply})
-            
+
             # 限制历史记录长度
             if len(current_context["history"]) > 20:
                 current_context["history"] = current_context["history"][-20:]
 
             self.context = current_context
-            
+
             logger.info(f"最终回复: {reply}")
-            
+
             yield reply, current_context
             
         except Exception as e:

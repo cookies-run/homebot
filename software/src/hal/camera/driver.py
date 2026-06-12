@@ -6,26 +6,46 @@ logger = get_logger(__name__)
 
 
 class CameraDriver:
-    def __init__(self, device: int = 0, flip_horizontal: bool = True, width: int = 0, height: int = 0):
-        """Open the camera device index (default 0).
+    def __init__(self, device: int = 0, device_name: str = "", flip_horizontal: bool = False, width: int = 0, height: int = 0):
+        """Open the camera by index or name.
 
         Args:
-            device: 摄像头设备索引
-            flip_horizontal: 是否水平翻转画面（默认 True，解决 USB 摄像头镜像问题）
+            device: 摄像头设备索引（当 device_name 为空时使用）
+            device_name: 摄像头名称子串（优先于 device），非空时按名称查找索引
+            flip_horizontal: 是否水平翻转画面（默认 False，保持物理真实方向）
             width: 请求的分辨率宽度（0 表示使用摄像头默认）
             height: 请求的分辨率高度（0 表示使用摄像头默认）
         """
         import cv2
         import sys
-        self._device = device
+
+        resolved_device = device
+        if device_name:
+            try:
+                from hal.camera.enumeration import find_camera_index
+                idx = find_camera_index(device_name)
+                if idx is not None and idx >= 0:
+                    resolved_device = idx
+                    logger.info(f"CameraDriver resolved '{device_name}' to OpenCV index {idx}")
+                else:
+                    logger.warning(
+                        f"CameraDriver name '{device_name}' not resolved, falling back to device={device}"
+                    )
+            except Exception as e:
+                logger.warning(f"CameraDriver failed to resolve name '{device_name}': {e}")
+
+        self._device = resolved_device
         self._flip_horizontal = flip_horizontal
         self._width = width
         self._height = height
         self._cap = self._create_capture()
         if not self._cap or not self._cap.isOpened():
-            logger.error(f"failed to open camera device {device}")
-            raise RuntimeError(f"Camera {device} open failed")
-        logger.info(f"camera {device} opened (flip_horizontal={flip_horizontal}, resolution={width}x{height})")
+            logger.error(f"failed to open camera device {resolved_device}")
+            raise RuntimeError(f"Camera {resolved_device} open failed")
+        logger.info(
+            f"camera {resolved_device} opened "
+            f"(flip_horizontal={flip_horizontal}, resolution={width}x{height})"
+        )
 
     def _create_capture(self):
         """创建并配置 VideoCapture 实例."""

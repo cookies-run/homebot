@@ -27,20 +27,32 @@ class ServoBusManager:
         return cls._instance
     
     def initialize(self, port: str, baudrate: int) -> bool:
-        """初始化串口总线（仅首次调用有效）"""
-        if self._initialized and self._bus is not None:
+        """初始化串口总线（支持重新连接）"""
+        # 如果总线已连接且参数没变，直接复用
+        if (self._initialized and self._bus is not None
+                and self._bus.is_connected()
+                and self._port == port and self._baudrate == baudrate):
             return True
-            
+
+        # 清理旧实例（如果已断开或参数变更）
+        if self._bus is not None:
+            try:
+                self._bus.disconnect()
+            except Exception:
+                pass
+            self._bus = None
+
         self._port = port
         self._baudrate = baudrate
         self._bus = FTServoBus(port, baudrate)
-        
+
         if self._bus.connect():
             self._initialized = True
             print(f"[ServoBusManager] 串口总线已初始化: {port} @ {baudrate}bps")
             return True
-        
+
         print(f"[ServoBusManager] 串口连接失败: {port}")
+        self._initialized = False
         return False
     
     def get_bus(self) -> Optional[FTServoBus]:

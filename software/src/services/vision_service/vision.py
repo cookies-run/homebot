@@ -13,13 +13,14 @@ logger = get_logger(__name__)
 class VisionService:
     """视觉服务: 直接采集图像,处理后发布给其他应用订阅."""
     
-    def __init__(self, pub_addr: str = "tcp://*:5560", config=None):
+    def __init__(self, pub_addr: str = "tcp://*:5560", config=None, flip_horizontal: bool = False):
         """
         初始化视觉服务.
-        
+
         Args:
             pub_addr: ZMQ PUB socket 绑定地址
             config: 配置对象,包含 camera 和 zmq 配置
+            flip_horizontal: 是否水平翻转图像（默认 False）
         """
         from common.zmq_helper import create_socket
         from configs.config import get_config
@@ -62,17 +63,19 @@ class VisionService:
             self._width = 640
             self._height = 480
         
+        self._flip_horizontal = flip_horizontal
+
         # 相机驱动 (延迟初始化)
         self._cam = None
-        
+
         # 运行标志
         self._running = False
 
     def _init_camera(self):
         """初始化相机驱动.
 
-        macOS 上如果配置了 device_name，使用原生的 AVFoundation 驱动以绕过
-        OpenCV 不稳定的整数索引；否则回退到 OpenCV CameraDriver。
+        macOS 上如果配置了 device_name 或 unique_id，使用原生的 AVFoundation
+        驱动以绕过 OpenCV 不稳定的整数索引；否则回退到 OpenCV CameraDriver。
         """
         import platform
         camera_cfg = getattr(self._config, 'camera', None)
@@ -81,31 +84,30 @@ class VisionService:
 
         if platform.system() == 'Darwin' and (device_name or unique_id):
             from hal.camera.avfoundation_driver import AVFoundationCameraDriver
-            # unique_id 优先；如果配置了 unique_id，按硬件 ID 直接匹配。
-            lookup_name = unique_id if unique_id else device_name
             self._cam = AVFoundationCameraDriver(
-                device_name=lookup_name,
+                device_name=device_name,
+                unique_id=unique_id,
                 width=self._width,
                 height=self._height,
                 fps=self._fps,
-                flip_horizontal=True,
+                flip_horizontal=self._flip_horizontal,
             )
             resolved_uid = getattr(self._cam, 'unique_id', '')
             logger.info(
                 f"AVFoundation camera initialized: name='{device_name}', unique_id={resolved_uid}, "
-                f"fps={self._fps}, resolution={self._width}x{self._height}, flip_horizontal=True"
+                f"fps={self._fps}, resolution={self._width}x{self._height}, flip_horizontal={self._flip_horizontal}"
             )
         else:
             from hal.camera.driver import CameraDriver
             self._cam = CameraDriver(
                 self._cam_device,
-                flip_horizontal=True,
+                flip_horizontal=self._flip_horizontal,
                 width=self._width,
                 height=self._height,
             )
             logger.info(
                 f"OpenCV camera initialized: device={self._cam_device}, fps={self._fps}, "
-                f"resolution={self._width}x{self._height}, flip_horizontal=True"
+                f"resolution={self._width}x{self._height}, flip_horizontal={self._flip_horizontal}"
             )
 
     def process_frame(self, frame):
