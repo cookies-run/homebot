@@ -367,11 +367,6 @@ class AutoGrabWorkflow:
             print(f"[GRAB] [YOLO] 无法读取图像: {image_path}, {e}")
             return None
 
-        # 通用过滤阈值（YOLO-World 和 COCO YOLO 共用）
-        conf_threshold = 0.15
-        min_area_ratio = 0.001
-        max_area_ratio = 0.95
-
         # ---------- 1. 优先尝试 YOLO-World（开放词汇，支持任意文本目标） ----------
         if self.yolo_world_model is not None:
             try:
@@ -383,20 +378,15 @@ class AutoGrabWorkflow:
                     self._yolo_world_last_classes = classes
 
                 results = self.yolo_world_model(image_path, verbose=False)
-                if results and len(results) > 0:
-                    boxes = results[0].boxes
-                    if boxes is not None and len(boxes) > 0:
-                        best = self._pick_best_yolo_box(
-                            boxes, img_w, img_h,
-                            conf_threshold=conf_threshold,
-                            min_area_ratio=min_area_ratio,
-                            max_area_ratio=max_area_ratio,
-                        )
-                        if best is not None:
-                            print(f"[GRAB] [YOLO-World] 检测到目标: conf={best['conf']:.2f}, "
-                                  f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
-                            return best["bbox"], best["cx_ratio"], best["area_ratio"]
-                        print("[GRAB] [YOLO-World] 未通过过滤条件")
+                best = self._pick_best_yolo_world_box(results, classes, img_w, img_h)
+                if best is not None:
+                    print(
+                        f"[GRAB] [YOLO-World] 检测到目标: prompt='{best['prompt']}' "
+                        f"conf={best['conf']:.2f}, center_x_ratio={best['cx_ratio']:.3f}, "
+                        f"area_ratio={best['area_ratio']:.3f}"
+                    )
+                    return best["bbox"], best["cx_ratio"], best["area_ratio"]
+                print("[GRAB] [YOLO-World] 未检测到高置信度目标")
             except Exception as e:
                 print(f"[GRAB] [YOLO-World] 推理异常: {e}")
 
@@ -420,18 +410,88 @@ class AutoGrabWorkflow:
 
         best = self._pick_best_yolo_box(
             boxes, img_w, img_h,
-            conf_threshold=conf_threshold,
-            min_area_ratio=min_area_ratio,
-            max_area_ratio=max_area_ratio,
+            conf_threshold=0.3,
+            min_area_ratio=0.005,
+            max_area_ratio=0.95,
             target_object=target_object,
         )
         if best is None:
-            print(f"[GRAB] [YOLO] 无有效检测框（共 {len(boxes)} 个被过滤）")
+            print(f"[GRAB] [YOLO] 无有效检测框或类别未匹配（共 {len(boxes)} 个原始框）")
             return None
 
-        print(f"[GRAB] [YOLO] COCO 匹配: {best.get('class_name', 'unknown')} conf={best['conf']:.2f}, "
-              f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
+        print(
+            f"[GRAB] [YOLO] COCO 匹配: {best.get('class_name', 'unknown')} "
+            f"conf={best['conf']:.2f}, center_x_ratio={best['cx_ratio']:.3f}, "
+            f"area_ratio={best['area_ratio']:.3f}"
+        )
         return best["bbox"], best["cx_ratio"], best["area_ratio"]
+
+    def _pick_best_yolo_world_box(
+        self,
+        results,
+        classes: list[str],
+        img_w: int,
+        img_h: int,
+    ) -> dict | None:
+        """处理 YOLO-World 的检测结果。
+
+        YOLO-World 通过 set_classes 把文本提示变成可检测类别。
+        这里只保留高置信度框（>=0.5），并按面积过滤，避免把背景误判成目标。
+        不启用 fallback：没有匹配到目标类别时直接返回 None，交由 VLM 处理。
+        """
+        if not results or len(results) == 0:
+            return None
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return None
+
+        conf_threshold = 0.5
+        min_area_ratio = 0.005
+        max_area_ratio = 0.95
+
+        confs = boxes.conf.cpu().numpy()
+        xyxy = boxes.xyxy.cpu().numpy()
+        cls_ids = boxes.cls.cpu().numpy().astype(int)
+
+        valid_boxes = []
+        for idx, (box, conf_val, cls_id) in enumerate(zip(xyxy, confs, cls_ids)):
+            x1, y1, x2, y2 = box
+            bw, bh = x2 - x1, y2 - y1
+            area_ratio = (bw * bh) / (img_w * img_h)
+            prompt = classes[cls_id] if 0 <= cls_id < len(classes) else "unknown"
+
+            if conf_val < conf_threshold:
+                print(
+                    f"[GRAB] [YOLO-World] raw #{idx}: '{prompt}' conf={conf_val:.2f} "
+                    f"area={area_ratio:.4f} -> 置信度低于 {conf_threshold}"
+                )
+                continue
+            if area_ratio > max_area_ratio or area_ratio < min_area_ratio:
+                print(
+                    f"[GRAB] [YOLO-World] raw #{idx}: '{prompt}' conf={conf_val:.2f} "
+                    f"area={area_ratio:.4f} -> 面积超出 [{min_area_ratio}, {max_area_ratio}]"
+                )
+                continue
+
+            cx_ratio = ((x1 + x2) / 2.0) / img_w
+            valid_boxes.append({
+                "idx": idx,
+                "conf": float(conf_val),
+                "area_ratio": area_ratio,
+                "cx_ratio": cx_ratio,
+                "bbox": (float(x1), float(y1), float(x2), float(y2)),
+                "prompt": prompt,
+            })
+            print(
+                f"[GRAB] [YOLO-World] raw #{idx}: '{prompt}' conf={conf_val:.2f} "
+                f"area={area_ratio:.4f} -> 有效"
+            )
+
+        if not valid_boxes:
+            return None
+
+        best = max(valid_boxes, key=lambda x: x["conf"])
+        return best
 
     def _pick_best_yolo_box(
         self,
@@ -443,20 +503,17 @@ class AutoGrabWorkflow:
         max_area_ratio: float,
         target_object: str | None = None,
     ) -> dict | None:
-        """从 YOLO 检测框中筛选并挑选最佳框。
+        """从 COCO YOLO 检测框中筛选并挑选最佳框。
 
-        对于 COCO YOLO，会尝试按类别名匹配 target_object；
-        匹配失败时 fallback 到最高置信度框。
+        优先按类别名匹配 target_object；匹配失败时不再 fallback 到最高置信度框，
+        避免把背景物体（如 bicycle、chair）误判为目标，导致底盘错误移动。
         """
         confs = boxes.conf.cpu().numpy()
         xyxy = boxes.xyxy.cpu().numpy()
-
-        # COCO 模型才有 cls，YOLO-World 的 classes 由 set_classes 决定
-        has_cls = hasattr(boxes, "cls") and boxes.cls is not None
-        cls_ids = boxes.cls.cpu().numpy().astype(int) if has_cls else [None] * len(confs)
+        cls_ids = boxes.cls.cpu().numpy().astype(int)
 
         target_classes = []
-        if target_object and self.yolo_model is not None:
+        if target_object:
             raw = target_object.strip().lower()
             for prefix in ["一个", "一包", "一张", "面前的", "这个", "那个"]:
                 if raw.startswith(prefix):
@@ -480,14 +537,20 @@ class AutoGrabWorkflow:
             bw, bh = x2 - x1, y2 - y1
             area_ratio = (bw * bh) / (img_w * img_h)
             class_name = ""
-            if cls_id is not None and self.yolo_model is not None:
+            if self.yolo_model is not None:
                 class_name = self.yolo_model.names.get(cls_id, "").lower()
 
             if conf_val < conf_threshold:
-                print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 置信度低于 {conf_threshold}")
+                print(
+                    f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} "
+                    f"area={area_ratio:.4f} -> 置信度低于 {conf_threshold}"
+                )
                 continue
             if area_ratio > max_area_ratio or area_ratio < min_area_ratio:
-                print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 面积超出 [{min_area_ratio}, {max_area_ratio}]")
+                print(
+                    f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} "
+                    f"area={area_ratio:.4f} -> 面积超出 [{min_area_ratio}, {max_area_ratio}]"
+                )
                 continue
 
             cx_ratio = ((x1 + x2) / 2.0) / img_w
@@ -499,7 +562,10 @@ class AutoGrabWorkflow:
                 "bbox": (float(x1), float(y1), float(x2), float(y2)),
                 "class_name": class_name,
             })
-            print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 有效")
+            print(
+                f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} "
+                f"area={area_ratio:.4f} -> 有效"
+            )
 
         if not valid_boxes:
             return None
@@ -517,10 +583,9 @@ class AutoGrabWorkflow:
                 print(f"[GRAB] [YOLO] 类别匹配成功: {best['class_name']} conf={best['conf']:.2f}")
                 return best
 
-        # fallback：选最高置信度框
-        best = max(valid_boxes, key=lambda x: x["conf"])
-        print(f"[GRAB] [YOLO] 无类别匹配，fallback 最高置信度: {best.get('class_name', 'unknown')} conf={best['conf']:.2f}")
-        return best
+        # 类别未匹配时不再 fallback，防止误判背景物体
+        print("[GRAB] [YOLO] 类别未匹配，放弃 COCO YOLO 结果，回退到 VLM")
+        return None
 
     # ==================== 运动学辅助 ====================
 
