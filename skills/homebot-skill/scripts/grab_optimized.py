@@ -242,18 +242,48 @@ class AutoGrabWorkflow:
     # ==================== YOLO 视觉伺服 ====================
 
     def _init_yolo(self):
-        """加载本地 YOLO 模型（用于 Phase 1/2 像素闭环伺服）"""
+        """加载本地 YOLO 模型（用于 Phase 1/2 像素闭环伺服）
+
+        加载顺序：
+        1. YOLO-World（开放词汇，可检测任意文本描述物体）
+        2. COCO 预训练 YOLO（速度快，固定 80 类）
+        如果都失败，Phase 1/2 将回退到 VLM。
+        """
         self.yolo_model = None
+        self.yolo_world_model = None
+        self._yolo_world_last_classes = None
+
         if not _YOLO_AVAILABLE:
             print("[GRAB] [WARN] ultralytics 未安装，Phase 1/2 将回退到 VLM")
             return
 
-        # 优先 yolo26n.pt（新且轻量），其次 yolo11n.pt
-        candidates = [
+        # ---- 1. 尝试加载 YOLO-World（开放词汇，支持文本提示）----
+        # s = small（速度优先），m = medium（速度与精度平衡）
+        models_dir = os.path.join(os.path.dirname(__file__), '../../../software/models')
+        world_candidates = [
+            ("yolov8s-worldv2.pt", os.path.join(models_dir, "yolov8s-worldv2.pt")),
+            ("yolov8m-worldv2.pt", os.path.join(models_dir, "yolov8m-worldv2.pt")),
+        ]
+        for name, path in world_candidates:
+            try:
+                print(f"[GRAB] [YOLO] 正在加载 YOLO-World 模型: {name}")
+                if os.path.exists(path):
+                    self.yolo_world_model = YOLO(path)
+                else:
+                    # 如果 models 目录没有，让 ultralytics 自动下载到当前目录
+                    self.yolo_world_model = YOLO(name)
+                print(f"[GRAB] [YOLO] YOLO-World 模型已加载: {name}")
+                break
+            except Exception as e:
+                print(f"[GRAB] [WARN] 加载 YOLO-World 模型失败 {name}: {e}")
+                continue
+
+        # ---- 2. 兜底加载 COCO 预训练 YOLO ----
+        coco_candidates = [
             os.path.join(os.path.dirname(__file__), '../../../software/models/yolo26n.pt'),
             os.path.join(os.path.dirname(__file__), '../../../software/models/yolo11n.pt'),
         ]
-        for path in candidates:
+        for path in coco_candidates:
             if os.path.exists(path):
                 try:
                     self.yolo_model = YOLO(path)
@@ -262,13 +292,53 @@ class AutoGrabWorkflow:
                 except Exception as e:
                     print(f"[GRAB] [WARN] 加载 YOLO 模型失败 {path}: {e}")
                     continue
-        print("[GRAB] [WARN] 未找到可用 YOLO 模型，Phase 1/2 将回退到 VLM")
+
+        if self.yolo_world_model is None and self.yolo_model is None:
+            print("[GRAB] [WARN] 未找到可用 YOLO 模型，Phase 1/2 将回退到 VLM")
 
     # ==================== YOLO 目标检测（新增） ====================
+
+    def _build_yolo_world_classes(self, target_object: str) -> list[str]:
+        """把目标描述转成 YOLO-World 可识别的英文提示词列表"""
+        cn_to_en = {
+            "纸巾": ["tissue", "paper", "napkin", "toilet paper"],
+            "纸": ["paper", "tissue", "napkin"],
+            "苹果": ["apple"],
+            "瓶子": ["bottle"],
+            "杯子": ["cup"],
+            "球": ["ball", "sports ball"],
+            "香蕉": ["banana"],
+            "橘子": ["orange"],
+            "手机": ["cell phone", "mobile phone"],
+            "遥控器": ["remote", "remote control"],
+            "钥匙": ["key"],
+            "笔": ["pen"],
+            "书": ["book"],
+            "盒子": ["box"],
+            "袋子": ["bag"],
+            "零食": ["snack", "food"],
+        }
+
+        raw = target_object.strip().lower()
+        for prefix in ["一个", "一包", "一张", "面前的", "这个", "那个"]:
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):].strip()
+
+        # 中文目标优先用映射；否则把原始字符串也当作提示词
+        prompts = cn_to_en.get(raw, [raw])
+        # 去重并保持顺序
+        seen = set()
+        unique = []
+        for p in prompts:
+            if p and p not in seen:
+                seen.add(p)
+                unique.append(p)
+        return unique
 
     def _yolo_detect_target(self, image_path: str, target_object: str) -> tuple | None:
         """
         使用本地 YOLO 检测目标物体，返回归一化信息。
+        优先使用 YOLO-World（开放词汇），失败再回退到 COCO YOLO。
 
         Returns:
             (target_bbox, center_x_ratio, area_ratio) 或 None
@@ -276,17 +346,56 @@ class AutoGrabWorkflow:
             center_x_ratio: 目标中心 x 占画面宽度的比例（0~1）
             area_ratio: 目标框面积占画面总面积的比例
         """
-        import cv2
+        import PIL.Image as Image
 
+        if self.yolo_world_model is None and self.yolo_model is None:
+            return None
+
+        try:
+            with Image.open(image_path) as img_obj:
+                img_w, img_h = img_obj.size
+        except Exception as e:
+            print(f"[GRAB] [YOLO] 无法读取图像: {image_path}, {e}")
+            return None
+
+        # 通用过滤阈值（YOLO-World 和 COCO YOLO 共用）
+        conf_threshold = 0.15
+        min_area_ratio = 0.001
+        max_area_ratio = 0.95
+
+        # ---------- 1. 优先尝试 YOLO-World（开放词汇，支持任意文本目标） ----------
+        if self.yolo_world_model is not None:
+            try:
+                classes = self._build_yolo_world_classes(target_object)
+                # 只在类别变化时才调用 set_classes，避免重复开销
+                if self._yolo_world_last_classes != classes:
+                    print(f"[GRAB] [YOLO-World] 设置检测类别: {classes}")
+                    self.yolo_world_model.set_classes(classes)
+                    self._yolo_world_last_classes = classes
+
+                results = self.yolo_world_model(image_path, verbose=False)
+                if results and len(results) > 0:
+                    boxes = results[0].boxes
+                    if boxes is not None and len(boxes) > 0:
+                        best = self._pick_best_yolo_box(
+                            boxes, img_w, img_h,
+                            conf_threshold=conf_threshold,
+                            min_area_ratio=min_area_ratio,
+                            max_area_ratio=max_area_ratio,
+                        )
+                        if best is not None:
+                            print(f"[GRAB] [YOLO-World] 检测到目标: conf={best['conf']:.2f}, "
+                                  f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
+                            return best["bbox"], best["cx_ratio"], best["area_ratio"]
+                        print("[GRAB] [YOLO-World] 未通过过滤条件")
+            except Exception as e:
+                print(f"[GRAB] [YOLO-World] 推理异常: {e}")
+
+        # ---------- 2. 回退到 COCO YOLO（固定 80 类） ----------
         if self.yolo_model is None:
             return None
 
-        img = cv2.imread(image_path)
-        if img is None:
-            print(f"[GRAB] [YOLO] 无法读取图像: {image_path}")
-            return None
-        img_h, img_w = img.shape[:2]
-
+        print("[GRAB] [YOLO-World] 未检测到目标，回退到 COCO YOLO")
         try:
             results = self.yolo_model(image_path, verbose=False)
         except Exception as e:
@@ -300,50 +409,79 @@ class AutoGrabWorkflow:
         if boxes is None or len(boxes) == 0:
             return None
 
+        best = self._pick_best_yolo_box(
+            boxes, img_w, img_h,
+            conf_threshold=conf_threshold,
+            min_area_ratio=min_area_ratio,
+            max_area_ratio=max_area_ratio,
+            target_object=target_object,
+        )
+        if best is None:
+            print(f"[GRAB] [YOLO] 无有效检测框（共 {len(boxes)} 个被过滤）")
+            return None
+
+        print(f"[GRAB] [YOLO] COCO 匹配: {best.get('class_name', 'unknown')} conf={best['conf']:.2f}, "
+              f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
+        return best["bbox"], best["cx_ratio"], best["area_ratio"]
+
+    def _pick_best_yolo_box(
+        self,
+        boxes,
+        img_w: int,
+        img_h: int,
+        conf_threshold: float,
+        min_area_ratio: float,
+        max_area_ratio: float,
+        target_object: str | None = None,
+    ) -> dict | None:
+        """从 YOLO 检测框中筛选并挑选最佳框。
+
+        对于 COCO YOLO，会尝试按类别名匹配 target_object；
+        匹配失败时 fallback 到最高置信度框。
+        """
         confs = boxes.conf.cpu().numpy()
         xyxy = boxes.xyxy.cpu().numpy()
-        cls_ids = boxes.cls.cpu().numpy().astype(int)
 
-        # 中文→英文 目标映射，用于匹配 YOLO class names
-        cn_to_en = {
-            "纸巾": ["tissue", "paper", "toilet paper", "book"],
-            "纸": ["tissue", "paper", "toilet paper", "book"],
-            "tissue": ["tissue", "paper", "toilet paper", "book"],
-            "苹果": ["apple"],
-            "apple": ["apple"],
-            "瓶子": ["bottle"],
-            "bottle": ["bottle"],
-            "杯子": ["cup"],
-            "cup": ["cup"],
-            "球": ["sports ball"],
-            "sports ball": ["sports ball"],
-            "香蕉": ["banana"],
-            "banana": ["banana"],
-            "橘子": ["orange"],
-            "orange": ["orange"],
-            "手机": ["cell phone"],
-            "cell phone": ["cell phone"],
-        }
+        # COCO 模型才有 cls，YOLO-World 的 classes 由 set_classes 决定
+        has_cls = hasattr(boxes, "cls") and boxes.cls is not None
+        cls_ids = boxes.cls.cpu().numpy().astype(int) if has_cls else [None] * len(confs)
 
-        # 清洗 target_object：去除常见前缀，统一小写
-        raw_target = target_object.strip().lower()
-        for prefix in ["一个", "一包", "一张", "面前的"]:
-            if raw_target.startswith(prefix):
-                raw_target = raw_target[len(prefix):].strip()
+        target_classes = []
+        if target_object and self.yolo_model is not None:
+            raw = target_object.strip().lower()
+            for prefix in ["一个", "一包", "一张", "面前的", "这个", "那个"]:
+                if raw.startswith(prefix):
+                    raw = raw[len(prefix):].strip()
+            cn_to_en = {
+                "纸巾": ["tissue", "paper", "toilet paper", "book"],
+                "纸": ["tissue", "paper", "toilet paper", "book"],
+                "苹果": ["apple"],
+                "瓶子": ["bottle"],
+                "杯子": ["cup"],
+                "球": ["sports ball"],
+                "香蕉": ["banana"],
+                "橘子": ["orange"],
+                "手机": ["cell phone"],
+            }
+            target_classes = cn_to_en.get(raw, [raw])
 
-        # 获取目标对应的英文候选类别名
-        target_classes = cn_to_en.get(raw_target, [raw_target])
-
-        # 筛选有效检测框（面积占比 0.005 ~ 0.85）
         valid_boxes = []
         for idx, (box, conf_val, cls_id) in enumerate(zip(xyxy, confs, cls_ids)):
             x1, y1, x2, y2 = box
             bw, bh = x2 - x1, y2 - y1
             area_ratio = (bw * bh) / (img_w * img_h)
-            if area_ratio > 0.85 or area_ratio < 0.005:
+            class_name = ""
+            if cls_id is not None and self.yolo_model is not None:
+                class_name = self.yolo_model.names.get(cls_id, "").lower()
+
+            if conf_val < conf_threshold:
+                print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 置信度低于 {conf_threshold}")
                 continue
+            if area_ratio > max_area_ratio or area_ratio < min_area_ratio:
+                print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 面积超出 [{min_area_ratio}, {max_area_ratio}]")
+                continue
+
             cx_ratio = ((x1 + x2) / 2.0) / img_w
-            class_name = self.yolo_model.names.get(cls_id, "").lower()
             valid_boxes.append({
                 "idx": idx,
                 "conf": float(conf_val),
@@ -352,32 +490,28 @@ class AutoGrabWorkflow:
                 "bbox": (float(x1), float(y1), float(x2), float(y2)),
                 "class_name": class_name,
             })
+            print(f"[GRAB] [YOLO] raw #{idx}: {class_name} conf={conf_val:.2f} area={area_ratio:.4f} -> 有效")
 
         if not valid_boxes:
-            print(f"[GRAB] [YOLO] 无有效检测框（共 {len(confs)} 个被过滤）")
             return None
 
-        # 尝试按类别名匹配目标
-        matched = []
-        for b in valid_boxes:
-            for tc in target_classes:
-                if tc in b["class_name"] or b["class_name"] in tc:
-                    matched.append(b)
-                    break
+        # COCO 模型优先按类别名匹配
+        if target_classes:
+            matched = []
+            for b in valid_boxes:
+                for tc in target_classes:
+                    if tc in b["class_name"] or b["class_name"] in tc:
+                        matched.append(b)
+                        break
+            if matched:
+                best = max(matched, key=lambda x: x["conf"])
+                print(f"[GRAB] [YOLO] 类别匹配成功: {best['class_name']} conf={best['conf']:.2f}")
+                return best
 
-        if matched:
-            # 类别匹配成功：选最高置信度
-            best = max(matched, key=lambda x: x["conf"])
-            print(f"[GRAB] [YOLO] 类别匹配成功: {best['class_name']} conf={best['conf']:.2f}, "
-                  f"bbox=({best['bbox'][2]-best['bbox'][0]:.0f}x{best['bbox'][3]-best['bbox'][1]:.0f}), "
-                  f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
-        else:
-            # 无类别匹配：fallback 到最高置信度框
-            best = max(valid_boxes, key=lambda x: x["conf"])
-            print(f"[GRAB] [YOLO] 无类别匹配，fallback 最高置信度: {best['class_name']} conf={best['conf']:.2f}, "
-                  f"center_x_ratio={best['cx_ratio']:.3f}, area_ratio={best['area_ratio']:.3f}")
-
-        return best["bbox"], best["cx_ratio"], best["area_ratio"]
+        # fallback：选最高置信度框
+        best = max(valid_boxes, key=lambda x: x["conf"])
+        print(f"[GRAB] [YOLO] 无类别匹配，fallback 最高置信度: {best.get('class_name', 'unknown')} conf={best['conf']:.2f}")
+        return best
 
     # ==================== 运动学辅助 ====================
 
