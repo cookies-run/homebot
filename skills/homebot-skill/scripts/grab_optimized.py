@@ -258,11 +258,13 @@ class AutoGrabWorkflow:
             return
 
         # ---- 1. 尝试加载 YOLO-World（开放词汇，支持文本提示）----
-        # s = small（速度优先），m = medium（速度与精度平衡）
+        # l = large（精度优先），m = medium（平衡），s = small（速度优先）
+        # 经测试 s 版对纸巾等小目标召回率偏低，默认优先使用 l 版
         models_dir = os.path.join(os.path.dirname(__file__), '../../../software/models')
         world_candidates = [
-            ("yolov8s-worldv2.pt", os.path.join(models_dir, "yolov8s-worldv2.pt")),
+            ("yolov8l-worldv2.pt", os.path.join(models_dir, "yolov8l-worldv2.pt")),
             ("yolov8m-worldv2.pt", os.path.join(models_dir, "yolov8m-worldv2.pt")),
+            ("yolov8s-worldv2.pt", os.path.join(models_dir, "yolov8s-worldv2.pt")),
         ]
         for name, path in world_candidates:
             try:
@@ -301,22 +303,29 @@ class AutoGrabWorkflow:
     def _build_yolo_world_classes(self, target_object: str) -> list[str]:
         """把目标描述转成 YOLO-World 可识别的英文提示词列表"""
         cn_to_en = {
-            "纸巾": ["tissue", "paper", "napkin", "toilet paper"],
-            "纸": ["paper", "tissue", "napkin"],
-            "苹果": ["apple"],
-            "瓶子": ["bottle"],
-            "杯子": ["cup"],
+            "纸巾": [
+                "a pack of tissues",
+                "white tissue box",
+                "paper napkin",
+                "facial tissue",
+                "tissue",
+                "paper",
+            ],
+            "纸": ["paper", "tissue", "napkin", "paper sheet"],
+            "苹果": ["apple", "red apple", "green apple"],
+            "瓶子": ["bottle", "plastic bottle", "glass bottle"],
+            "杯子": ["cup", "mug", "paper cup", "plastic cup"],
             "球": ["ball", "sports ball"],
-            "香蕉": ["banana"],
-            "橘子": ["orange"],
-            "手机": ["cell phone", "mobile phone"],
-            "遥控器": ["remote", "remote control"],
-            "钥匙": ["key"],
-            "笔": ["pen"],
-            "书": ["book"],
-            "盒子": ["box"],
-            "袋子": ["bag"],
-            "零食": ["snack", "food"],
+            "香蕉": ["banana", "yellow banana"],
+            "橘子": ["orange", "mandarin orange", "tangerine"],
+            "手机": ["cell phone", "mobile phone", "smartphone"],
+            "遥控器": ["remote", "remote control", "TV remote"],
+            "钥匙": ["key", "keys"],
+            "笔": ["pen", "ballpoint pen"],
+            "书": ["book", "notebook"],
+            "盒子": ["box", "cardboard box", "package box"],
+            "袋子": ["bag", "plastic bag", "paper bag"],
+            "零食": ["snack", "snack bag", "food package"],
         }
 
         raw = target_object.strip().lower()
