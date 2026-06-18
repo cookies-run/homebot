@@ -31,9 +31,10 @@ if os.path.exists(_skills_scripts_path):
     sys.path.insert(0, _skills_scripts_path)
 
 try:
-    from auto_grab_workflow import AutoGrabWorkflow
+    # 使用 grab_optimized 中的五阶段状态机抓取工作流
+    from grab_optimized import AutoGrabWorkflow
     _AUTO_GRAB_AVAILABLE = True
-    logger.info("AutoGrabWorkflow 导入成功")
+    logger.info("AutoGrabWorkflow (grab_optimized) 导入成功")
 except ImportError as e:
     _AUTO_GRAB_AVAILABLE = False
     logger.warning(f"AutoGrabWorkflow 导入失败: {e}")

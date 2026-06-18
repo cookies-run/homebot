@@ -18,7 +18,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/scripts")
 from scripts.chassis_control import HomeBotChassisController
 from scripts.arm_control import HomeBotArmController
 from scripts.what_does_robot_see_workflow import WhatDoesRobotSeeWorkflow
-from scripts.auto_grab_workflow import AutoGrabWorkflow
+# 使用 grab_optimized 中的五阶段状态机抓取工作流
+from scripts.grab_optimized import AutoGrabWorkflow
 from scripts.robot_config import ROBOT_IP, CHASSIS_PORT, ARM_PORT
 
 # 优先 MiniMax VLM，回退火山引擎
@@ -119,18 +120,21 @@ async def robot_what_does_robot_see() -> str:
 
 @mcp.tool()
 async def auto_grab(
-    target: str = Field(description="要抓取的目标物品描述，例如'一包纸巾'、'一个红色苹果'"),
-    use_end_camera: bool = Field(default=False, description="是否使用机械臂末端摄像头进行精对准")
+    target: str = Field(description="要抓取的目标物品描述，例如'一包纸巾'、'一个红色苹果'、'桌上的矿泉水瓶'"),
+    use_end_camera: bool = Field(default=True, description="是否使用机械臂末端摄像头进行精对准。抓取类命令建议开启（默认 true）")
 ) -> str:
-    """自主抓取指定物品。
+    """自主抓取/拿起/拿取指定物品。
 
-    机器人会主动观察画面、识别目标位置、调整机械臂姿态，然后执行抓取。
-    不需要指定具体关节角度，只需描述要抓什么。
+    当用户发出抓取、拿起、拿取、取物、捡起等命令时调用此工具。
+    机器人会主动观察画面、识别目标位置、调整底盘与机械臂姿态，然后执行抓取。
+    不需要指定具体关节角度或底盘距离，只需描述要抓什么。
 
-    示例:
+    典型触发语句:
         - "帮我拿那包纸巾"
         - "抓取桌上的红色苹果"
         - "把那个蓝色的盒子拿起来"
+        - "捡起地上的玩具"
+        - "取一下桌角的遥控器"
     """
     try:
         workflow = AutoGrabWorkflow(

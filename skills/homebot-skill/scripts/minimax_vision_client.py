@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-MiniMax VLM 客户端
-调用 MiniMax /v1/coding_plan/vlm 端点进行图像理解
-
-注意：MiniMax 视觉 API 与标准聊天 API 是两套独立系统，
-必须使用 /v1/coding_plan/vlm 端点，标准端点会静默忽略图片。
+MiniMax 视觉客户端
+支持：
+  1. /v1/coding_plan/vlm 端点（原生 MiniMax VLM）
+  2. /v1/chat/completions 端点（MiniMax-M2.7 原生多模态模型，OpenAI 兼容格式）
 
 环境变量:
     MINIMAX_API_KEY  - API 密钥 (必填)
@@ -47,6 +46,30 @@ def create_image_url(image_path: str) -> str:
     return f"data:{mime_type};base64,{b64}"
 
 
+def _get_api_key_and_host(api_key: Optional[str], api_host: Optional[str]) -> tuple[str, str]:
+    """获取并规范化 API key 和 host"""
+    api_key = api_key or os.getenv("MINIMAX_API_KEY") or os.getenv("LLM_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "MINIMAX_API_KEY 或 LLM_API_KEY 未配置！请设置环境变量:\n"
+            "  export MINIMAX_API_KEY=your_api_key"
+        )
+
+    if not api_host:
+        api_host = os.getenv("MINIMAX_API_HOST")
+    if not api_host:
+        llm_url = os.getenv("LLM_API_URL", "")
+        if llm_url:
+            from urllib.parse import urlparse
+            parsed = urlparse(llm_url)
+            api_host = f"{parsed.scheme}://{parsed.netloc}"
+    if not api_host:
+        api_host = "https://api.minimaxi.com"
+    api_host = api_host.rstrip("/")
+
+    return api_key, api_host
+
+
 def analyze_images(
     image_paths: List[str],
     prompt: str = "请描述这张图片的内容",
@@ -55,7 +78,7 @@ def analyze_images(
     timeout: int = 60,
 ) -> str:
     """
-    调用 MiniMax VLM 分析图片内容
+    调用 MiniMax /v1/coding_plan/vlm 端点分析图片内容
 
     Args:
         image_paths: 图片文件路径列表（目前 MiniMax VLM 只支持单图，取第一张）
@@ -66,36 +89,12 @@ def analyze_images(
 
     Returns:
         VLM 返回的文本内容
-
-    Raises:
-        ValueError: API Key 未配置
-        RuntimeError: API 返回错误
     """
-    api_key = api_key or os.getenv("MINIMAX_API_KEY") or os.getenv("LLM_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "MINIMAX_API_KEY 或 LLM_API_KEY 未配置！请设置环境变量:\n"
-            "  export MINIMAX_API_KEY=your_api_key"
-        )
-
-    # 优先 MINIMAX_API_HOST，其次从 LLM_API_URL 提取 base host，默认国内端点
-    if not api_host:
-        api_host = os.getenv("MINIMAX_API_HOST")
-    if not api_host:
-        llm_url = os.getenv("LLM_API_URL", "")
-        if llm_url:
-            # 去掉 /v1 等后缀，保留 https://host 部分
-            from urllib.parse import urlparse
-            parsed = urlparse(llm_url)
-            api_host = f"{parsed.scheme}://{parsed.netloc}"
-    if not api_host:
-        api_host = "https://api.minimaxi.com"
-    api_host = api_host.rstrip("/")
+    api_key, api_host = _get_api_key_and_host(api_key, api_host)
 
     if not image_paths:
         raise ValueError("至少需要一张图片")
 
-    # MiniMax VLM 目前只支持单图分析
     image_url = create_image_url(image_paths[0])
 
     url = f"{api_host}/v1/coding_plan/vlm"
@@ -122,6 +121,86 @@ def analyze_images(
         raise RuntimeError(f"MiniMax API 错误 [{status_code}]: {status_msg}")
 
     return data.get("content", "")
+
+
+def analyze_images_m3(
+    image_paths: List[str],
+    prompt: str = "请描述这张图片的内容",
+    api_key: Optional[str] = None,
+    api_host: Optional[str] = None,
+    timeout: int = 60,
+    model: str = "MiniMax-M2.7",
+) -> str:
+    """
+    调用 MiniMax 多模态模型分析图片。
+
+    M2.7 不支持 /v1/chat/completions 的 image_url 格式，需要走原生 /v1/coding_plan/vlm 端点；
+    M3 及后续支持 OpenAI 兼容 image_url 的模型走 /v1/chat/completions 端点。
+
+    Args:
+        image_paths: 图片文件路径列表（M2.7 仅使用第一张）
+        prompt: 对图片的提问或指令
+        api_key: API 密钥
+        api_host: API 地址
+        timeout: 请求超时秒数
+        model: 模型 ID，默认 "MiniMax-M2.7"
+
+    Returns:
+        模型返回的文本内容
+    """
+    # M2.7 不支持 /v1/chat/completions 的 image_url 格式，需要走原生 VLM 端点
+    if "M2" in model or "m2" in model:
+        return analyze_images(
+            image_paths=image_paths,
+            prompt=prompt,
+            api_key=api_key,
+            api_host=api_host,
+            timeout=timeout,
+        )
+
+    api_key, api_host = _get_api_key_and_host(api_key, api_host)
+
+    if not image_paths:
+        raise ValueError("至少需要一张图片")
+
+    content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for path in image_paths:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": create_image_url(path)},
+        })
+
+    url = f"{api_host}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"MiniMax Chat Completions API 请求失败: {e}")
+
+    data = resp.json()
+    if data.get("error"):
+        raise RuntimeError(f"MiniMax Chat Completions API 错误: {data['error']}")
+
+    choices = data.get("choices", [])
+    if not choices:
+        raise RuntimeError("MiniMax Chat Completions API 返回为空 choices")
+
+    message = choices[0].get("message", {})
+    return message.get("content", "")
 
 
 def main():

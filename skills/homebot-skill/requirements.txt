@@ -5,6 +5,10 @@ Pillow>=9.0.0
 # 视觉分析功能（可选）
 volcenginesdkarkruntime>=1.0.0
 
+# 自主抓取工作流（grab_optimized 依赖 OpenCV Tracker，CSRT/KCF 追踪器在 contrib 包中）
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0
+
 # MCP 服务器支持（可选）
 mcp>=1.0.0
 

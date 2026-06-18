@@ -1,11 +1,7 @@
 ---
 name: homebot
-<<<<<<< HEAD
-description: HomeBot 完整机器人控制器技能，集成了机器人底盘运动控制、机械臂关节控制、摄像头视觉画面捕获三个子功能，全部基于 ZeroMQ 局域网通信协议，完美匹配 HomeBot 项目服务端架构。
-version: 1.0.0
-=======
-description: HomeBot 完整机器人控制器技能，集成底盘运动控制、机械臂关节控制、摄像头视觉画面捕获与AI分析，全部基于 ZeroMQ 局域网通信协议。
->>>>>>> f737069 (homebot-skill更新)
+description: HomeBot 完整机器人控制器技能。当用户发出抓取/拿起/拿取类命令（如“抓取桌上的苹果”“帮我拿包纸巾”“把那个瓶子拿起来”）时，必须调用 auto_grab 工具执行自主视觉引导抓取；同时集成底盘运动控制、机械臂关节控制、摄像头视觉画面捕获与AI分析，全部基于 ZeroMQ 局域网通信协议。
+version: 1.0.3
 metadata:
   openclaw:
     requires:
@@ -20,15 +16,31 @@ metadata:
 
 # HomeBot Robot Controller
 
-HomeBot 完整机器人控制器技能，集成三大功能模块：
+HomeBot 完整机器人控制器技能，集成四大功能模块：
 - 🚗 **底盘控制**：前进/后退/转向，精确距离角度控制
 - 🦾 **机械臂控制**：6自由度关节控制，夹爪控制，回原点
+- 🤏 **自主抓取**：视觉引导自动识别、定位并抓取指定物品
 - 👁️ **视觉查询**：一键捕获机器人摄像头画面，**自动调用火山引擎 LLM 分析图像内容**
 
 全部基于 ZeroMQ REQ-REP / PUB 局域网通信协议，完美匹配 HomeBot 项目服务端架构。
 
-<<<<<<< HEAD
-=======
+## Agent 调用触发词
+
+当收到以下任一类型的自然语言指令时，Agent 应调用本技能的 MCP 工具 `auto_grab`：
+
+| 触发类型 | 示例命令 |
+|---------|---------|
+| 抓取 | “抓取桌上的一包纸巾”、“把那个红色苹果抓起来” |
+| 拿起/拿取 | “帮我拿瓶矿泉水”、“把地上的玩具捡起来” |
+| 取物 | “取一下桌角的遥控器”、“把笔递给我” |
+| 收拾/移动 | “把这个空杯子拿到旁边” |
+
+**调用约定：**
+- 首选调用 MCP 工具 `auto_grab(target="目标物品描述")`，不要先调用底盘或机械臂工具做预对准。
+- 如果 MCP 不可用、必须退回到 shell 执行时，请直接运行 `python scripts/grab_optimized.py --target "目标物品"`，**不要**运行任何名为 `auto_grab_workflow` 的旧脚本（该文件已废弃并重命名为 `_auto_grab_workflow_legacy.py`）。
+- `target` 应包含物品名称及其位置/外观特征，例如 `"桌上的一包纸巾"`、`"红色的苹果"`。
+- 当命令意图明确为抓取时，优先使用末端摄像头精对准：`auto_grab(target="...", use_end_camera=true)`。
+
 ## 快速开始
 
 ### 1. 配置机器人连接
@@ -69,6 +81,9 @@ python scripts/arm_control.py status
 
 # 测试视觉捕获
 python scripts/what_does_robot_see_workflow.py --no-analysis
+
+# 测试自主抓取（默认抓取一包纸巾）
+python scripts/grab_optimized.py
 ```
 
 ---
@@ -83,6 +98,7 @@ python scripts/what_does_robot_see_workflow.py --no-analysis
 | `HOMEBOT_CHASSIS_PORT` | 底盘服务端口 | `5556` |
 | `HOMEBOT_ARM_PORT` | 机械臂服务端口 | `5557` |
 | `HOMEBOT_VIDEO_PORT` | 视频流端口 | `5560` |
+| `HOMEBOT_END_VIDEO_PORT` | 机械臂末端摄像头端口 | `5561` |
 | `HOMEBOT_CAPTURE_TIMEOUT` | 图像捕获超时(秒) | `10.0` |
 | `HOMEBOT_OUTPUT_DIR` | 图像保存目录 | `.` |
 | `ARK_API_KEY` | 火山引擎 API Key（视觉分析） | - |
@@ -105,6 +121,7 @@ mcp:
         HOMEBOT_CHASSIS_PORT: "5556"
         HOMEBOT_ARM_PORT: "5557"
         HOMEBOT_VIDEO_PORT: "5560"
+        HOMEBOT_END_VIDEO_PORT: "5561"
         
         # 火山引擎视觉分析配置（可选）
         ARK_API_KEY: "your-api-key-here"
@@ -113,13 +130,13 @@ mcp:
 
 ---
 
->>>>>>> f737069 (homebot-skill更新)
 ## 模块说明
 
 | 模块 | 功能 | 默认端口 | 源文件 |
 |------|------|----------|--------|
 | `chassis` | 底盘运动控制 | 5556 | `chassis_control.py` |
 | `arm` | 机械臂关节控制 | 5557 | `arm_control.py` |
+| `grab` | 自主视觉引导抓取 | 5560/5561 | `grab_optimized.py` |
 | `vision` | 摄像头画面捕获+AI分析 | 5560 | `video_subscriber.py` / `what_does_robot_see_workflow.py` |
 | `gestures` | 机械臂姿态动作（挥手/点头/摇头） | - | `arm_gestures.py` |
 
@@ -258,11 +275,62 @@ arm.close()
 
 ---
 
-## 3. 视觉查询 (Vision)
+## 3. 自主抓取 (Grab)
 
-<<<<<<< HEAD
-一键捕获机器人摄像头最新画面，工作流：获取最新帧 → 保存图片 → 返回文件路径。当用户问"机器人看到了什么"自动触发。
-=======
+基于 **五阶段状态机** 的自主视觉引导抓取：
+- **Phase 0**: 机械臂回到观察姿态
+- **Phase 1**: VLM 属性测姿 + 底盘粗定位
+- **Phase 2**: 末端摄像头追踪 + 手腕姿态预部署
+- **Phase 2.5**: 纯几何二次距离闭环，精准贴紧
+- **Phase 3**: VLM 触达确认 / 对齐终审
+- **Phase 4**: 夹紧、抬升、回缩
+
+### 前置要求
+
+1. 机器人底盘、机械臂服务已启动
+2. 机身摄像头（端口 5560）已发布画面
+3. 机械臂末端摄像头（端口 5561）已发布画面（当前实现 Phase 2 起依赖末端摄像头）
+4. 已配置 VLM API Key（MiniMax 优先，可回退到 MiMo / 火山引擎）
+5. Python 环境已安装 `opencv-python` 和 `numpy`
+
+### 命令行使用
+
+```bash
+# 默认抓取一包纸巾
+python scripts/grab_optimized.py
+
+# 抓取指定物品
+python scripts/grab_optimized.py --target "一瓶矿泉水"
+
+# 指定机器人 IP
+python scripts/grab_optimized.py --ip 192.168.1.13
+
+# 禁用末端摄像头（当前版本仍会检测，缺失会失败）
+python scripts/grab_optimized.py --no-end-camera
+```
+
+### Python API
+
+```python
+from scripts.grab_optimized import AutoGrabWorkflow
+
+workflow = AutoGrabWorkflow(
+    robot_ip="192.168.1.13",
+    video_port=5560,          # 机身摄像头
+    end_video_port=5561,      # 末端摄像头
+    arm_port=5557,
+    max_attempts=8,
+    use_end_camera=True,      # 建议启用
+)
+
+result = workflow.run(target_object="一包纸巾")
+print(result)
+```
+
+---
+
+## 4. 视觉查询 (Vision)
+
 一键捕获机器人摄像头最新画面，**集成火山引擎 LLM 自动分析图像内容**。
 
 ### 前置要求
@@ -274,17 +342,10 @@ arm.close()
 export ARK_API_KEY="your-api-key-here"
 export ARK_MODEL_ID="doubao-seed-2-0-lite-260215"  # 可选
 ```
->>>>>>> f737069 (homebot-skill更新)
 
 ### 一键完整工作流（捕获 + 分析）
 
 ```bash
-<<<<<<< HEAD
-python skills/homebot/scripts/what_does_robot_see_workflow.py
-```
-
-输出：保存的JPEG图像文件路径（带时间戳命名）
-=======
 # 捕获图像并自动分析
 python scripts/what_does_robot_see_workflow.py
 
@@ -306,7 +367,7 @@ python scripts/what_does_robot_see_workflow.py --model doubao-vision-pro-250226
 [INFO] 文件大小: 45231 字节
 [INFO] 正在使用火山引擎分析图片...
 [INFO] 模型: doubao-vision-lite-250225
->>>>>>> f737069 (homebot-skill更新)
+```
 
 ### 视频订阅工具
 
@@ -345,15 +406,13 @@ analysis = workflow.analyze("path/to/image.jpg")
 
 ---
 
-<<<<<<< HEAD
-=======
 ## MCP 服务器支持 🚀
 
 本技能内置 **Model Context Protocol (MCP)** 服务器，可直接配置给 OpenClaw/LLM 调用，让 AI 自动操控机器人！
 
 ### 功能封装
 
-MCP 服务器封装了以下 9 个工具：
+MCP 服务器封装了以下工具：
 
 | 工具名称 | 功能描述 |
 |---------|---------|
@@ -365,6 +424,7 @@ MCP 服务器封装了以下 9 个工具：
 | `arm_move_joint` | 移动机械臂指定关节到目标角度 |
 | `arm_get_positions` | 获取机械臂所有关节当前位置 |
 | `arm_stop` | 停止机械臂所有运动 |
+| `auto_grab` | **抓取/拿起/拿取指定物品（Agent 收到抓取命令时直接调用）**。机器人主动观察、识别、定位并执行抓取，无需手动预对准。 |
 | `robot_what_does_robot_see` | 捕获机器人画面并 AI 分析场景 |
 
 ### MCP 配置方法
@@ -381,6 +441,7 @@ mcp:
       env:
         # === 机器人连接配置（必填）===
         HOMEBOT_IP: "192.168.1.13"
+        HOMEBOT_END_VIDEO_PORT: "5561"
         
         # === 火山引擎视觉分析配置（可选，用于 robot_what_does_robot_see 功能）===
         ARK_API_KEY: "your-volcengine-api-key"
@@ -400,11 +461,11 @@ pip install mcp
 配置完成后，LLM 即可**直接调用所有机器人控制工具**，自动完成：
 - 根据自然语言指令控制机器人移动
 - 调整机械臂位置
+- 自主识别并抓取指定物品
 - 让机器人自动观察环境并报告场景
 
 ---
 
->>>>>>> f737069 (homebot-skill更新)
 ## 通信协议
 
 全部基于 ZeroMQ 协议，完全匹配 HomeBot 项目服务端配置：
@@ -414,6 +475,7 @@ pip install mcp
 | 底盘控制 | REQ-REP | 5556 |
 | 机械臂控制 | REQ-REP | 5557 |
 | 视频发布 | PUB | 5560 |
+| 末端摄像头发布 | PUB | 5561 |
 
 HomeBot 服务端配置示例：
 ```python
@@ -424,18 +486,6 @@ class ZMQConfig:
     vision_pub_addr: str = "tcp://*:5560"
 ```
 
-<<<<<<< HEAD
-## 依赖
-
-- Python 3.x
-- pyzmq >= 25.0.0
-- Pillow >= 9.0.0
-- volcenginesdkarkruntime >= 1.0.0（视觉分析功能需要）
-
-## 示例
-
-- `scripts/dance.py` - 机械臂舞蹈动作示例
-=======
 ---
 
 ## 依赖
@@ -443,6 +493,8 @@ class ZMQConfig:
 - Python 3.8+
 - pyzmq >= 25.0.0
 - Pillow >= 9.0.0
+- numpy >= 1.24.0
+- opencv-python >= 4.8.0（自主抓取功能需要）
 - volcenginesdkarkruntime >= 1.0.0（视觉分析功能需要）
 - mcp >= 1.0.0（MCP 服务器需要）
 
@@ -473,6 +525,12 @@ python scripts/arm_gestures.py shake
 python scripts/arm_gestures.py all
 ```
 
+### 自主视觉抓取
+
+```bash
+python scripts/grab_optimized.py --target "桌上的红色苹果"
+```
+
 ---
 
 ## 故障排除
@@ -496,6 +554,17 @@ echo %ARK_API_KEY%
 echo $ARK_API_KEY
 ```
 
+### 自主抓取提示 "OpenCV Tracker 不可用"
+
+安装 OpenCV：
+```bash
+pip install opencv-python numpy
+```
+
+### 自主抓取在 Phase 2 失败 "末端摄像头不可用"
+
+确保末端摄像头服务已启动，并在 `scripts/robot_config.py` 中正确配置 `END_VIDEO_PORT`（默认 5561）。
+
 ### 端口冲突
 
 检查端口是否被占用：
@@ -506,4 +575,3 @@ netstat -ano | findstr 5556
 # Linux/Mac
 lsof -i :5556
 ```
->>>>>>> f737069 (homebot-skill更新)

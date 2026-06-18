@@ -75,7 +75,7 @@ class HomeBotChassisController:
     def forward_cm(self, distance_cm: float, speed: float = DEFAULT_SPEED) -> bool:
         """前进指定距离（厘米）"""
         distance = abs(distance_cm) / 100.0  # convert to meters
-        duration = distance / abs(speed) * 2  # 加倍运动时间（实际距离不足）
+        duration = distance / abs(speed) * 1.5  # 1.5倍时间补偿（折中校准）
         
         direction = 1 if distance_cm > 0 else -1
         target_vx = speed * direction
@@ -107,7 +107,7 @@ class HomeBotChassisController:
     def left_deg(self, angle_deg: float, angular_speed: float = DEFAULT_ANGULAR_SPEED) -> bool:
         """左转指定角度（度）"""
         angle_rad = math.radians(angle_deg)
-        duration = abs(angle_rad / angular_speed) * 2  # 加倍运动时间（实际角度不足）
+        duration = abs(angle_rad / angular_speed) * 1.5  # 1.5倍时间补偿（折中校准）
         
         target_vz = -angular_speed  # 左转vz为负
         print(f"Turning {abs(angle_deg)} degrees left at {abs(angular_speed)}rad/s (duration: {duration:.2f}s - 加倍时间补偿)")
@@ -134,7 +134,7 @@ class HomeBotChassisController:
     def right_deg(self, angle_deg: float, angular_speed: float = DEFAULT_ANGULAR_SPEED) -> bool:
         """右转指定角度（度）"""
         angle_rad = math.radians(angle_deg)
-        duration = abs(angle_rad / angular_speed) * 2  # 加倍运动时间（实际角度不足）
+        duration = abs(angle_rad / angular_speed) * 1.5  # 1.5倍时间补偿（折中校准）
         
         target_vz = angular_speed  # 右转vz为正（用户要求）
         print(f"Turning {abs(angle_deg)} degrees right at {abs(angular_speed)}rad/s (duration: {duration:.2f}s - 加倍时间补偿)")

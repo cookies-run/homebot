@@ -449,6 +449,19 @@ python -m tests.test_web_control
 python software/tools/download_models.py
 ```
 
+## 技能包 (Skills)
+
+项目通过 [Claude Code / OpenClaw 技能机制](https://docs.claude.ai/code/skill) 暴露机器人控制能力：
+
+- **`HomeBot/skills/homebot-skill/`**: 独立技能包，提供基于 MCP 的机器人控制工具。
+  - 入口脚本: `mcp_homebot_server.py`
+  - 核心能力:
+    - 底盘控制: `chassis_forward`, `chassis_backward`, `chassis_left`, `chassis_right`, `chassis_stop`
+    - 机械臂控制: `arm_move_joint`, `arm_get_positions`, `arm_stop`
+    - 视觉查询: `robot_what_does_robot_see`
+    - **自主抓取: `auto_grab(target, use_end_camera)`** — 当收到“抓取/拿起/拿取/捡起”等命令时调用，基于 `scripts/grab_optimized.py` 的五阶段状态机完成视觉引导抓取。
+  - 配置方式: 将 `mcp_homebot_server.py` 配置到 MCP 服务器列表，并设置 `HOMEBOT_IP` 等环境变量。
+
 ## 扩展开发
 
 添加新应用模块的步骤：
@@ -459,4 +472,4 @@ python software/tools/download_models.py
 
 ---
 
-*最后更新：2026-03-17*
+*最后更新：2026-06-16*
