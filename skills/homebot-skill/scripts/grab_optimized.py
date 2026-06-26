@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Auto Grab Workflow - 五阶段状态机自主抓取（运动学版 + OpenCV Tracker 视觉伺服）
+Auto Grab Workflow - 六阶段状态机自主抓取（运动学版 + OpenCV Tracker 视觉伺服）
 
 核心设计：
     - Phase 0: 观察与环境准备
     - Phase 1: 属性测姿与底盘策略分流（VLM）
     - Phase 2: 接近与手腕姿态预部署（端侧 Tracker + VLM 初始化末端追踪）
-    - Phase 2.5: 二次距离闭环与精准贴紧（纯几何，无 VLM）
-    - Phase 3: 触达确认与大模型终审（VLM）
-    - Phase 4: 夹紧抬升与回缩验证
+    - Phase 3: 二次距离闭环与精准贴紧（纯几何，无 VLM）
+    - Phase 4: 触达确认与大模型终审（VLM）
+    - Phase 5: 夹紧抬升与回缩验证
 
 坐标系约定（User Frame）：
     - r > 0：机器人前进方向
@@ -16,7 +16,7 @@ Auto Grab Workflow - 五阶段状态机自主抓取（运动学版 + OpenCV Trac
     - pitch = -90°：垂直向下
     - pitch = 0°：水平向前
 
-VLM 调用：不做硬次数限制，按需调用（Phase 1/2/3 及异常恢复）。
+VLM 调用：不做硬次数限制，按需调用（Phase 1/2/4 及异常恢复）。
 
 用法:
     python grab_optimized.py              # 默认抓取纸巾
@@ -54,6 +54,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from video_subscriber import VideoSubscriber
 from arm_control import HomeBotArmController
 from chassis_control import HomeBotChassisController
+
+# 3D-aware grasping utilities (optional; gracefully degrade if missing or uncalibrated)
+_3D_GEOMETRY_AVAILABLE = False
+try:
+    from camera_geometry import load_calibration
+    _3D_GEOMETRY_AVAILABLE = True
+except ImportError as e:
+    print(f"[GRAB] [WARN] camera_geometry 不可用: {e}")
 
 # 视觉分析客户端优先级：MiniMax -> MiMo -> 火山引擎
 _AVAILABLE_VLM = []
@@ -160,9 +168,9 @@ _TRACKER_MAX_CENTER_JUMP_RATIO = 0.25   # 中心点在单帧内跳变超过图�
 # 机械臂运动到位后等待画面稳定的时间（秒）
 _POST_MOVE_SETTLE_S = 0.3
 
-# Phase 2.5 中周期性 VLM 重定位的步长；设为 None 表示关闭周期性重定位，
+# Phase 3 中周期性 VLM 重定位的步长；设为 None 表示关闭周期性重定位，
 # 只在 Tracker 漂移/丢失（sanity check 失败）时触发 VLM 重定位。
-_PHASE25_VLM_REINIT_EVERY_N = None
+_PHASE3_VLM_REINIT_EVERY_N = None
 
 
 # ========== 姿态分流参数表（User Frame） ==========
@@ -172,18 +180,18 @@ _POSE_PARAMS = {
         # Phase 1 底盘停靠距离：直立柱体需留足机械臂从侧面插入的空间
         "stop_distance_cm": (22, 25),
         # Phase 2 预部署：侧面、水平、留足够安全间隙，避免 base 微调时爪子推到瓶子
-        # 底盘 22-25cm 时，爪子从 r=55mm 开始，Phase 2.5 再逐步前进贴紧
+        # 底盘 22-25cm 时，爪子从 r=55mm 开始，Phase 3 再逐步前进贴紧
         # z=90 让夹爪对准物体中下部分（矿泉水瓶等柱体）
         "pre_deploy_rz": (55, 90, 0),
         "safety_gap_cm": 3,
-        # Phase 2.5 微调方向
+        # Phase 3 微调方向
         "tune_direction": "r",
         "tune_step_mm": 4,
         "tune_max_steps": 30,
-        # Phase 2.5 停止阈值：直立物体以 width_ratio 为主，y2 为辅
+        # Phase 3 停止阈值：直立物体以 width_ratio 为主，y2 为辅
         "tune_target_width_ratio": 0.22,
         "tune_target_y2_ratio": 0.88,
-        # Phase 3/4 抓取与抬升
+        # Phase 4/5 抓取与抬升
         "grasp_pitch": 0,
         "lift_trajectory": [
             (70, 150, 0),
@@ -196,11 +204,11 @@ _POSE_PARAMS = {
         # Phase 2 预部署：物体正上方、垂直向下（z=100 保证高于桌面）
         "pre_deploy_rz": (80, 100, -90),
         "safety_gap_cm": 0,
-        # Phase 2.5 微调方向
+        # Phase 3 微调方向
         "tune_direction": "z",
         "tune_step_mm": 4,
         "tune_max_steps": 14,
-        # Phase 2.5 停止阈值：倾倒物体以 y2_ratio 为主，area_ratio 为辅
+        # Phase 3 停止阈值：倾倒物体以 y2_ratio 为主，area_ratio 为辅
         "tune_target_area_ratio": 0.25,
         "tune_target_y2_ratio": 0.82,
         "grasp_pitch": -90,
@@ -246,12 +254,13 @@ def validate_vlm_bbox(bbox, img_width=1280, img_height=720):
 
 
 class GrabPhase(Enum):
-    OBSERVATION = 0
-    DETECTION = 1
-    APPROACH = 2
-    FINAL_TUNING = 3
-    TOUCH_VERIFY = 4
-    GRASP_LIFT = 5
+    """六阶段抓取状态机的阶段编号（与 _phaseN_* 方法、日志中的 "Phase N" 一一对应）。"""
+    OBSERVATION = 0   # Phase 0: 观察与环境准备
+    DETECTION = 1     # Phase 1: 属性测姿与底盘策略分流（VLM + 机身 Tracker）
+    APPROACH = 2      # Phase 2: 接近与手腕姿态预部署（末端 Tracker + base 对准）
+    FINAL_TUNING = 3  # Phase 3: 二次距离闭环与精准贴紧（纯几何）
+    TOUCH_VERIFY = 4  # Phase 4: 触达确认与大模型终审（VLM）
+    GRASP_LIFT = 5    # Phase 5: 夹紧抬升与回缩验证
 
 
 class UserKinematicsAdapter:
@@ -303,7 +312,7 @@ class UserKinematicsAdapter:
 
 class AutoGrabWorkflow:
     """
-    自主抓取工作流（五阶段状态机，2 次 VLM 调用）。
+    自主抓取工作流（六阶段状态机，3 次 VLM 调用）。
     """
 
     def __init__(
@@ -334,6 +343,12 @@ class AutoGrabWorkflow:
             L2=_ARM_CFG.forearm_length,
         )
         self._user_kin = UserKinematicsAdapter(self._kin)
+
+        # 3D 感知标定数据（可选；缺失时自动降级为 2D 策略）
+        self._calibration = None
+        self._3d_enabled = False
+        self._3d_status_message = ""
+        self._load_calibration()
 
         # 当前末端位置（User Frame）
         self._current_rz = {"r": 0.0, "z": 0.0}
@@ -381,7 +396,7 @@ class AutoGrabWorkflow:
         self.fine_r_step = 2
         self.fine_z_step = 2
 
-        # Phase 2.5 视觉停止后的最终接近距离（cm）
+        # Phase 3 视觉停止后的最终接近距离（cm）
         # 根据当前 h_ratio 自适应：越近则最终接近越短，避免已经贴上还往前顶。
         self.final_approach_cm = 6.0  # 旧默认值，保留兼容；实际使用 _compute_final_approach_cm
 
@@ -389,6 +404,30 @@ class AutoGrabWorkflow:
         self.phase1_area_distance_k = 64.0
         self.phase1_area_too_close = 0.30
         self.phase1_y2_too_close = 0.78
+
+    def _load_calibration(self):
+        """加载相机标定数据；缺失时保持 2D 模式。"""
+        if not _3D_GEOMETRY_AVAILABLE:
+            self._3d_status_message = "camera_geometry 模块未导入"
+            return
+
+        calib_dir = os.path.join(os.path.dirname(__file__), "calibration_data")
+        end_calib = load_calibration("end", calib_dir)
+        body_calib = load_calibration("body", calib_dir)
+
+        if end_calib is None and body_calib is None:
+            self._3d_status_message = "未找到相机标定数据，使用 2D 策略"
+            return
+
+        self._calibration = {"end": end_calib, "body": body_calib}
+        # Phase 1 MVP: 只需要末端相机内参即可启用 grasp_center 像素去畸变等基础功能。
+        # 完整 3D 射线功能需要外参（Phase 2）。
+        self._3d_enabled = end_calib is not None and end_calib.has_intrinsics()
+        self._3d_status_message = (
+            f"3D 感知已启用: end_intrinsics={end_calib is not None}, "
+            f"end_extrinsics={end_calib.has_extrinsics() if end_calib else False}, "
+            f"body_calib={body_calib is not None}"
+        )
 
     # ==================== Tracker 视觉伺服 ====================
 
@@ -963,46 +1002,57 @@ class AutoGrabWorkflow:
             return True
         return False
 
-    def _phase1_vlm_call(self, image_path: str, target_object: str) -> dict | None:
-        """Phase 1 第 1 次 VLM：返回 JSON {bbox, is_cylinder, pose}"""
+    def _vlm_detect_pose(self, image_path: str, target_object: str) -> dict | None:
+        """Phase 1 第 1 次 VLM：返回 JSON {bbox, is_cylinder, pose, grasp_center?, visible_faces?}"""
         prompt = f'''你是机器人的高精度视觉定位助手。请在图片中找到目标物体"{target_object}"，并只返回以下 JSON：
 
 {{
   "bbox": [x1, y1, x2, y2],
   "is_cylinder": true/false,
-  "pose": "upright" | "fallen"
+  "pose": "upright" | "fallen",
+  "grasp_center": [cx, cy],
+  "visible_faces": "front|top|side|back"
 }}
 
-其中 bbox 为 0~1 归一化坐标（或 0~1000 整数）；is_cylinder 表示是否为圆柱/瓶罐类；pose 表示姿态："upright" 为直立站立，"fallen" 为倾倒/横躺。
+其中：
+- bbox 为 0~1 归一化坐标（或 0~1000 整数）；
+- is_cylinder 表示是否为圆柱/瓶罐类；
+- pose 表示姿态："upright" 为直立站立，"fallen" 为倾倒/横躺；
+- grasp_center 是"夹爪应该对准的像素点"，通常位于物体可见部分的中心或最稳定的抓取受力点，可以与 bbox 中心不同；
+- visible_faces 描述从当前视角能看到的主要面（如 "front"、"top"、"side" 等，可多选/组合）。
 
 只输出 JSON，不要 Markdown 代码块、解释或任何额外文字。'''
         return self._vlm_call(image_path, prompt, ["bbox", "is_cylinder", "pose"],
-                              max_tokens=256, timeout=60)
+                              max_tokens=320, timeout=60)
 
-    def _phase2_vlm_call(self, image_path: str, target_object: str) -> dict | None:
-        """Phase 2 第 2 次 VLM：末端摄像头目标定位，返回 JSON {bbox}"""
-        prompt = f'''你是机器人的高精度视觉定位助手。图片来自机械臂末端的摄像头，当前距离目标物体极近。你的任务是为 OpenCV Tracker 提供精准的目标边界框。
+    def _vlm_locate_target(self, image_path: str, target_object: str) -> dict | None:
+        """Phase 2 第 2 次 VLM：末端摄像头目标定位，返回 JSON {bbox, grasp_center}"""
+        prompt = f'''你是机器人的高精度视觉定位助手。图片来自机械臂末端的摄像头，当前距离目标物体极近。你的任务是为 OpenCV Tracker 提供精准的目标边界框和抓取点。
 
 【核心任务】：
-精准定位目标物体"{target_object}"。
+精准定位目标物体"{target_object}"，并给出夹爪应该对准的像素点。
 
 【执行约束】：
 1. 几何无偏见：无论目标是长方体、圆柱体、球体还是不规则形状，请框选物体的可见主体部分。
 2. 形状过滤：目标物体的边界框应符合正常的物理长宽比（长宽比应在 0.2 到 4.0 之间）。如果你的定位结果长宽比极其异常（如覆盖全屏的横向长条或过细的线条），请重新审视并修正，不要框选背景或桌面边缘。
 3. 夹爪屏蔽：严禁将机械臂夹爪、机械臂自身结构、阴影或桌面边缘框入。
-4. 中心优先：如果目标物体较大，请框选最适合作为“抓取受力点”的区域。
+4. 抓取点优先：输出一个 "grasp_center" 点，代表两片夹爪应该对准的位置。该点可以与 bbox 的几何中心不同，例如：
+   - 直立瓶罐：对准瓶身中部（而非顶部或底部）；
+   - 倾倒物体：对准物体可见部分的重心；
+   - 不规则物体：对准最稳定、最不容易滑脱的受力点。
 
 【输出格式】：
 只返回纯 JSON 字符串，严禁任何 Markdown 代码块或额外文字。
 
 返回格式：
 {{
-  "bbox": [x1, y1, x2, y2]
+  "bbox": [x1, y1, x2, y2],
+  "grasp_center": [cx, cy]
 }}
 
 注意：坐标请使用 [0, 1000] 的整数范围。'''
         return self._vlm_call(image_path, prompt, ["bbox"],
-                              max_tokens=128, timeout=60)
+                              max_tokens=192, timeout=60)
 
     def _phase1_detect_and_align(self, target_object: str) -> dict:
         """Phase 1: 属性测姿 + Tracker 驱动底盘 coarse alignment"""
@@ -1016,7 +1066,7 @@ class AutoGrabWorkflow:
 
         detection = None
         for attempt in range(1, 4):
-            detection = self._phase1_vlm_call(img_path, target_object)
+            detection = self._vlm_detect_pose(img_path, target_object)
             if detection is None:
                 print(f"[GRAB] [Phase1] VLM 第 {attempt}/3 次调用失败，重试...")
                 continue
@@ -1031,23 +1081,34 @@ class AutoGrabWorkflow:
         if detection is None:
             return {"success": False, "message": "Phase 1 VLM 属性测姿失败或 bbox 校验未通过"}
 
-        # 解析并存储 object_pose
+        # 解析并存储 object_pose（含可选的 3D 感知字段）
         bbox = detection["bbox"]
         pose = detection.get("pose", "fallen").lower()
         if pose not in ("upright", "fallen"):
             pose = "fallen"
+
+        grasp_center = detection.get("grasp_center")
+        visible_faces = detection.get("visible_faces")
+
         self._object_pose = {
             "bbox": bbox,
             "is_cylinder": bool(detection.get("is_cylinder", False)),
             "pose": pose,
+            "grasp_center": grasp_center,
+            "visible_faces": visible_faces,
             "image_w": frame_bgr.shape[1] if frame_bgr is not None else None,
             "image_h": frame_bgr.shape[0] if frame_bgr is not None else None,
             "vlm_provider": detection.get("_provider"),
         }
+        extra_info = []
+        if grasp_center is not None:
+            extra_info.append(f"grasp_center={grasp_center}")
+        if visible_faces is not None:
+            extra_info.append(f"visible_faces={visible_faces}")
         print(f"[GRAB] [Phase1] 测姿结果: pose={pose}, is_cylinder={self._object_pose['is_cylinder']}, "
-              f"bbox={bbox}")
+              f"bbox={bbox}" + (f", {', '.join(extra_info)}" if extra_info else ""))
 
-        # 用 VLM bbox 初始化机身 Tracker
+        # 用 VLM bbox 初始化机身 Tracker（Phase 1 粗定位，bbox 足够）
         if frame_bgr is not None:
             h, w = frame_bgr.shape[:2]
             x1, y1, x2, y2 = bbox
@@ -1102,7 +1163,7 @@ class AutoGrabWorkflow:
                         self._body_tracker_initialized = False
                 else:
                     print("[GRAB] [Phase1] Tracker 丢失，尝试 VLM 重定位")
-                    detection = self._phase1_vlm_call(img_path, target_object)
+                    detection = self._vlm_detect_pose(img_path, target_object)
                     if detection is not None:
                         bbox = detection["bbox"]
                         self._object_pose["bbox"] = bbox
@@ -1225,7 +1286,7 @@ class AutoGrabWorkflow:
         )
 
     def _phase2_approach_and_deploy(self, target_object: str) -> dict:
-        """Phase 2: 末端摄像头 Tracker base 对准 + 手腕预部署"""
+        """Phase 2: 末端摄像头 Tracker base 对准 + 手腕姿态预部署"""
         print("\n[GRAB] ====== Phase 2: 接近与手腕姿态预部署 ======")
         pose = self._object_pose.get("pose", "fallen")
         params = _POSE_PARAMS[pose]
@@ -1240,14 +1301,19 @@ class AutoGrabWorkflow:
         self._end_tracker_bbox = None
         self._end_tracker_lost_count = 0
 
-        # 初始化 end tracker：优先用 VLM 给出精确 bbox，失败再回退几何投影/中心框
+        # 初始化 end tracker：优先用 VLM 给出精确 bbox + grasp_center，失败再回退几何投影/中心框
         init_img_path, init_frame_bgr = self.capture_end("phase2_init")
         if init_frame_bgr is None:
             return {"success": False, "message": "Phase 2 末端摄像头捕获失败"}
 
         print("[GRAB] [Phase2] 第 2 次 VLM：末端摄像头目标定位")
-        detection = self._phase2_vlm_call(init_img_path, target_object)
+        detection = self._vlm_locate_target(init_img_path, target_object)
+
+        end_grasp_center = detection.get("grasp_center") if detection else None
+        self._object_pose["end_grasp_center"] = end_grasp_center
+
         ok = False
+        vlm_bbox = None
         if detection is not None and "bbox" in detection:
             bbox = detection["bbox"]
             valid, reason = self._validate_vlm_bbox(bbox)
@@ -1255,7 +1321,32 @@ class AutoGrabWorkflow:
                 h, w = init_frame_bgr.shape[:2]
                 x1, y1, x2, y2 = bbox
                 vlm_bbox = (x1 * w, y1 * h, x2 * w, y2 * h)
-                print(f"[GRAB] [Phase2] VLM 定位 bbox: {vlm_bbox}")
+
+                # 如果 VLM 给出了 grasp_center，把 tracker 初始框中心移到 grasp_center，
+                # 大小保持 bbox 原尺寸。这样后续 Tracker/对齐都以真实抓取点为中心。
+                if end_grasp_center is not None:
+                    gc = end_grasp_center
+                    if max(gc) <= 1.0:
+                        gc_x, gc_y = gc[0] * w, gc[1] * h
+                    else:
+                        gc_x, gc_y = gc[0] / 1000.0 * w, gc[1] / 1000.0 * h
+                    bw = vlm_bbox[2] - vlm_bbox[0]
+                    bh = vlm_bbox[3] - vlm_bbox[1]
+                    shifted_bbox = (
+                        max(0, gc_x - bw / 2),
+                        max(0, gc_y - bh / 2),
+                        min(w, gc_x + bw / 2),
+                        min(h, gc_y + bh / 2),
+                    )
+                    if shifted_bbox[2] > shifted_bbox[0] and shifted_bbox[3] > shifted_bbox[1]:
+                        print(f"[GRAB] [Phase2] VLM 定位 bbox={vlm_bbox}, grasp_center=({gc_x:.1f}, {gc_y:.1f})，"
+                              f"tracker 初始框中心已对齐抓取点")
+                        vlm_bbox = shifted_bbox
+                    else:
+                        print(f"[GRAB] [WARN] grasp_center 导致框无效，回退到 bbox 中心")
+                else:
+                    print(f"[GRAB] [Phase2] VLM 定位 bbox: {vlm_bbox} (无 grasp_center)")
+
                 ok = self._init_tracker("_end_tracker", init_frame_bgr, vlm_bbox)
             else:
                 print(f"[GRAB] [ERR] Phase 2 VLM 框尺寸或比例异常，判定为幻觉（{reason}），回退到几何投影")
@@ -1399,33 +1490,33 @@ class AutoGrabWorkflow:
     def _reinit_end_tracker_with_vlm(self, image_path: str, frame_bgr: np.ndarray,
                                      target_object: str, reason: str = "VLM 重新定位") -> bool:
         """用 VLM 重新划定 end Tracker，成功返回 True 并更新内部状态。"""
-        print(f"[GRAB] [Phase2.5] {reason}，调用 VLM 重新划定 Tracker...")
+        print(f"[GRAB] [Phase3] {reason}，调用 VLM 重新划定 Tracker...")
         for attempt in range(1, 3):
-            detection = self._phase2_vlm_call(image_path, target_object)
+            detection = self._vlm_locate_target(image_path, target_object)
             if detection is None or "bbox" not in detection:
-                print(f"[GRAB] [Phase2.5] VLM 重定位第 {attempt}/2 次调用失败，重试...")
+                print(f"[GRAB] [Phase3] VLM 重定位第 {attempt}/2 次调用失败，重试...")
                 continue
             bbox = detection["bbox"]
             valid, reason_err = self._validate_vlm_bbox(bbox)
             if not valid:
-                print(f"[GRAB] [Phase2.5] VLM 框校验失败（{reason_err}），重试...")
+                print(f"[GRAB] [Phase3] VLM 框校验失败（{reason_err}），重试...")
                 continue
             h, w = frame_bgr.shape[:2]
             x1, y1, x2, y2 = bbox
             vlm_bbox = (x1 * w, y1 * h, x2 * w, y2 * h)
             ok = self._init_tracker("_end_tracker", frame_bgr, vlm_bbox)
             if ok:
-                print(f"[GRAB] [Phase2.5] ✅ VLM 重定位成功，新框=({vlm_bbox[0]:.1f}, {vlm_bbox[1]:.1f}, "
+                print(f"[GRAB] [Phase3] ✅ VLM 重定位成功，新框=({vlm_bbox[0]:.1f}, {vlm_bbox[1]:.1f}, "
                       f"{vlm_bbox[2]:.1f}, {vlm_bbox[3]:.1f})")
                 return True
-        print("[GRAB] [Phase2.5] ❌ VLM 重定位失败")
+        print("[GRAB] [Phase3] ❌ VLM 重定位失败")
         return False
 
-    # ==================== Phase 2.5: 二次距离闭环与精准贴紧 ====================
+    # ==================== Phase 3: 二次距离闭环与精准贴紧 ====================
 
-    def _phase2_5_final_tuning(self, target_object: str) -> dict:
-        """Phase 2.5: 二次距离闭环与精准贴紧（周期性或 Tracker 异常时调用 VLM 重定位）"""
-        print("\n[GRAB] ====== Phase 2.5: 二次距离闭环与精准贴紧 ======")
+    def _phase3_final_tuning(self, target_object: str) -> dict:
+        """Phase 3: 二次距离闭环与精准贴紧（周期性或 Tracker 异常时调用 VLM 重定位）"""
+        print("\n[GRAB] ====== Phase 3: 二次距离闭环与精准贴紧 ======")
         pose = self._object_pose.get("pose", "fallen")
         params = _POSE_PARAMS[pose]
         direction = params["tune_direction"]
@@ -1435,24 +1526,24 @@ class AutoGrabWorkflow:
         target_y2 = params["tune_target_y2_ratio"]
         if pose == "upright":
             target_width = params["tune_target_width_ratio"]
-            print(f"[GRAB] [Phase2.5] 停止阈值: width>={target_width:.2f} 且 y2>={target_y2:.2f}")
+            print(f"[GRAB] [Phase3] 停止阈值: width>={target_width:.2f} 且 y2>={target_y2:.2f}")
         else:
             target_area = params["tune_target_area_ratio"]
-            print(f"[GRAB] [Phase2.5] 停止阈值: area>={target_area:.2f} 且 y2>={target_y2:.2f}")
+            print(f"[GRAB] [Phase3] 停止阈值: area>={target_area:.2f} 且 y2>={target_y2:.2f}")
 
         # 直立物体防推动检测：记录最近 h_ratio（高度占比），连续下降则停止
         h_history = [] if pose == "upright" else None
 
         for step in range(1, max_steps + 1):
-            print(f"\n[GRAB] [Phase2.5] --- 第 {step}/{max_steps} 次微调 ({direction}) ---")
-            img_path, frame_bgr = self.capture_end(f"phase2_5_{step}")
+            print(f"\n[GRAB] [Phase3] --- 第 {step}/{max_steps} 次微调 ({direction}) ---")
+            img_path, frame_bgr = self.capture_end(f"phase3_{step}")
             if frame_bgr is None:
                 continue
 
             # 在 Tracker 漂移/丢失后用 VLM 重新划定 end Tracker；
-            # 若开启周期性重定位（_PHASE25_VLM_REINIT_EVERY_N 为整数），则同时按步长触发。
+            # 若开启周期性重定位（_PHASE3_VLM_REINIT_EVERY_N 为整数），则同时按步长触发。
             reinit_reason = None
-            if _PHASE25_VLM_REINIT_EVERY_N is not None and step % _PHASE25_VLM_REINIT_EVERY_N == 0:
+            if _PHASE3_VLM_REINIT_EVERY_N is not None and step % _PHASE3_VLM_REINIT_EVERY_N == 0:
                 reinit_reason = f"第 {step} 步周期性 VLM 重定位"
             elif not self._end_tracker_initialized:
                 reinit_reason = "end Tracker 未初始化，VLM 重定位"
@@ -1463,9 +1554,9 @@ class AutoGrabWorkflow:
 
             ok, bbox_xywh = self._update_tracker("_end_tracker", frame_bgr)
             if not ok:
-                print("[GRAB] [Phase2.5] end Tracker 丢失，跳过本次")
+                print("[GRAB] [Phase3] end Tracker 丢失，跳过本次")
                 if self._end_tracker_lost_count >= 3:
-                    return {"success": False, "message": "Phase 2.5 end Tracker 持续丢失"}
+                    return {"success": False, "message": "Phase 3 end Tracker 持续丢失"}
                 continue
 
             h, w = frame_bgr.shape[:2]
@@ -1479,17 +1570,17 @@ class AutoGrabWorkflow:
                 "width_ratio": width_ratio,
                 "h_ratio": h_ratio,
             }
-            print(f"[GRAB] [Phase2.5] Tracker: cx={cx_ratio:.3f}, cy={cy_ratio:.3f}, area={area_ratio:.3f}, y2={y2_ratio:.3f}, w={width_ratio:.3f}, h_ratio={h_ratio:.3f}")
-            self._save_debug_frame(frame_bgr, bbox_xyxy, f"phase2_5_{step}", metrics)
+            print(f"[GRAB] [Phase3] Tracker: cx={cx_ratio:.3f}, cy={cy_ratio:.3f}, area={area_ratio:.3f}, y2={y2_ratio:.3f}, w={width_ratio:.3f}, h_ratio={h_ratio:.3f}")
+            self._save_debug_frame(frame_bgr, bbox_xyxy, f"phase3_{step}", metrics)
 
-            # 注：Phase 2.5 不再因为水平漂移而回退到 Phase 2。
-            # 近景时侧装摄像头 parallax 会让 cx 明显偏离 0.5，这种视觉偏置在 Phase 3 VLM 终审中再处理；
+            # 注：Phase 3 不再因为水平漂移而回退到 Phase 2。
+            # 近景时侧装摄像头 parallax 会让 cx 明显偏离 0.5，这种视觉偏置在 Phase 4 VLM 终审中再处理；
             # 这里只做同一周期内的保守水平微调（见下方 error_x 分支）。
 
             if pose == "fallen":
                 # 垂直下降：目标底部接近画面底部且面积足够大
                 if y2_ratio >= target_y2 and area_ratio >= target_area:
-                    print("[GRAB] [Phase2.5] ✅ 倾倒物体已下降至目标位置")
+                    print("[GRAB] [Phase3] ✅ 倾倒物体已下降至目标位置")
                     break
                 ok = self._move_to_rz_relative(dr=0, dz=-step_mm, pitch=params["grasp_pitch"],
                                                desc="倾倒物体垂直下降", wait=1.0)
@@ -1500,14 +1591,14 @@ class AutoGrabWorkflow:
                 # 只在偏移较大时做保守 base 修正，避免频繁抖动或过度补偿
                 error_x = cx_ratio - 0.5
                 if abs(error_x) > 0.12:
-                    KP_BASE_PHASE25 = 3.0
-                    base_offset = error_x * KP_BASE_PHASE25
+                    KP_BASE_PHASE3 = 3.0
+                    base_offset = error_x * KP_BASE_PHASE3
                     base_offset = max(0.3, min(0.6, abs(base_offset))) * (1 if error_x > 0 else -1)
                     current_angles = self.get_current_angles()
                     current_base = current_angles.get("base", OBSERVATION_POSE.get("base", -90))
                     new_base = current_base + base_offset
                     new_base = self.clamp(new_base, _JOINT_LIMITS["base"][0], _JOINT_LIMITS["base"][1])
-                    print(f"[GRAB] [Phase2.5] 水平微调: cx={cx_ratio:.3f}, base {current_base:.1f}° -> {new_base:.1f}°")
+                    print(f"[GRAB] [Phase3] 水平微调: cx={cx_ratio:.3f}, base {current_base:.1f}° -> {new_base:.1f}°")
                     align_pose = {
                         "base": new_base,
                         "shoulder": current_angles.get("shoulder", 0),
@@ -1516,23 +1607,23 @@ class AutoGrabWorkflow:
                         "wrist_roll": _GRAB_WRIST_ROLL,
                         "gripper": 90,
                     }
-                    self._move_to_pose(align_pose, "Phase2.5 水平微调", wait=0.6)
+                    self._move_to_pose(align_pose, "Phase3 水平微调", wait=0.6)
 
                 # 垂直微调：根据物体中心 cy 调整 z，使夹爪对准物体中下部分
                 # cy > 0.5 表示物体中心在画面下半部分，夹爪偏高，需要下降
                 error_y = cy_ratio - 0.5
                 if abs(error_y) > 0.08:
-                    KP_Z_PHASE25 = 8.0
-                    dz_cm = -error_y * KP_Z_PHASE25
+                    KP_Z_PHASE3 = 8.0
+                    dz_cm = -error_y * KP_Z_PHASE3
                     dz_cm = max(0.3, min(1.5, abs(dz_cm))) * (1 if dz_cm > 0 else -1)
-                    print(f"[GRAB] [Phase2.5] 垂直微调: cy={cy_ratio:.3f}, 调整 z {dz_cm:+.2f}cm")
+                    print(f"[GRAB] [Phase3] 垂直微调: cy={cy_ratio:.3f}, 调整 z {dz_cm:+.2f}cm")
                     self._arm_move_relative(up_cm=dz_cm)
 
                 # 防推动/防异常：连续 h_ratio 下降说明可能已顶到物体或 Tracker 漂移，停止前进
                 h_history.append(h_ratio)
                 if len(h_history) >= 4:
                     if h_history[-1] < h_history[-2] < h_history[-3] < h_history[-4]:
-                        print("[GRAB] [Phase2.5] ⚠️ h_ratio 连续下降，判断已接触物体或 Tracker 异常，停止前进")
+                        print("[GRAB] [Phase3] ⚠️ h_ratio 连续下降，判断已接触物体或 Tracker 异常，停止前进")
                         break
 
                 # 使用高度占比闭环进行深度微调
@@ -1551,13 +1642,13 @@ class AutoGrabWorkflow:
                 if strict_done or composite_done:
                     reason = "深度与宽度/y2 均达标" if strict_done else "综合指标已接近目标"
                     final_approach = self._compute_final_approach_cm(h_ratio)
-                    print(f"[GRAB] [Phase2.5] ✅ {reason}，执行最终接近 {final_approach:.1f}cm (h_ratio={h_ratio:.3f})")
+                    print(f"[GRAB] [Phase3] ✅ {reason}，执行最终接近 {final_approach:.1f}cm (h_ratio={h_ratio:.3f})")
                     self._arm_move_relative(forward_cm=final_approach)
                     break
 
                 if depth_done:
                     # 深度已达标但 width/y2 仍未达标，执行一次保守前伸作为 fallback
-                    print("[GRAB] [Phase2.5] 深度已达标，继续保守前伸以扩大 width/y2")
+                    print("[GRAB] [Phase3] 深度已达标，继续保守前伸以扩大 width/y2")
                     ok = self._move_to_rz_relative(dr=step_mm, dz=0, pitch=params["grasp_pitch"],
                                                    desc="直立物体水平贴紧(fallback)", wait=1.0)
                 else:
@@ -1565,23 +1656,23 @@ class AutoGrabWorkflow:
                     ok = True
 
             if not ok:
-                return {"success": False, "message": "Phase 2.5 微调运动失败"}
+                return {"success": False, "message": "Phase 3 微调运动失败"}
 
         self._phase = GrabPhase.TOUCH_VERIFY
-        return {"success": True, "message": "Phase 2.5 完成"}
+        return {"success": True, "message": "Phase 3 完成"}
 
-    # ==================== Phase 3: 触达确认与大模型终审 ====================
+    # ==================== Phase 4: 触达确认与大模型终审 ====================
 
-    def _phase3_touch_verify(self, target_object: str) -> dict:
-        """Phase 3: 第 3 次 VLM，触碰终审"""
-        print("\n[GRAB] ====== Phase 3: 触达确认与大模型终审 ======")
+    def _phase4_touch_verify(self, target_object: str) -> dict:
+        """Phase 4: 第 3 次 VLM，触碰终审"""
+        print("\n[GRAB] ====== Phase 4: 触达确认与大模型终审 ======")
         print("[GRAB] 第 3 次 VLM：末端摄像头对齐校验")
 
         pose = self._object_pose.get("pose", "fallen")
 
-        img_path, frame_bgr = self.capture_end("phase3_verify")
+        img_path, frame_bgr = self.capture_end("phase4_verify")
         if img_path is None:
-            return {"success": False, "message": "Phase 3 图像捕获失败"}
+            return {"success": False, "message": "Phase 4 图像捕获失败"}
 
         if pose == "upright":
             specific_q = (
@@ -1618,31 +1709,31 @@ class AutoGrabWorkflow:
         result = self._vlm_call(img_path, prompt, ["aligned", "reason"],
                                 max_tokens=128, timeout=60)
         if result is None:
-            return {"success": False, "message": "Phase 3 VLM 终审失败"}
+            return {"success": False, "message": "Phase 4 VLM 终审失败"}
 
         aligned = bool(result.get("aligned", False))
         reason = result.get("reason", "")
-        print(f"[GRAB] [Phase3] VLM 终审: aligned={aligned}, reason={reason}")
+        print(f"[GRAB] [Phase4] VLM 终审: aligned={aligned}, reason={reason}")
 
         if not aligned:
-            print("[GRAB] [Phase3] ❌ 对齐校验未通过，禁止闭合夹爪，回退观察姿态")
+            print("[GRAB] [Phase4] ❌ 对齐校验未通过，禁止闭合夹爪，回退观察姿态")
             self._phase0_observation_reset()
-            return {"success": False, "message": f"Phase 3 对齐校验未通过: {reason}"}
+            return {"success": False, "message": f"Phase 4 对齐校验未通过: {reason}"}
 
-        print("[GRAB] [Phase3] ✅ 对齐校验通过，放行抓取")
+        print("[GRAB] [Phase4] ✅ 对齐校验通过，放行抓取")
         self._phase = GrabPhase.GRASP_LIFT
-        return {"success": True, "message": "Phase 3 通过"}
+        return {"success": True, "message": "Phase 4 通过"}
 
-    # ==================== Phase 4: 夹紧抬升与回缩验证 ====================
+    # ==================== Phase 5: 夹紧抬升与回缩验证 ====================
 
-    def _phase4_grasp_and_lift(self, target_object: str) -> dict:
-        """Phase 4: 闭合夹爪 + pose-specific 抬升 + 验证"""
-        print("\n[GRAB] ====== Phase 4: 夹紧抬升与回缩验证 ======")
+    def _phase5_grasp_and_lift(self, target_object: str) -> dict:
+        """Phase 5: 闭合夹爪 + pose-specific 抬升 + 验证"""
+        print("\n[GRAB] ====== Phase 5: 夹紧抬升与回缩验证 ======")
         pose = self._object_pose.get("pose", "fallen")
         params = _POSE_PARAMS[pose]
 
-        # 张开 -> 微调闭合前姿态（已在 Phase 2.5 到位）
-        print("[GRAB] [Phase4] 1/3 张开夹爪并确认姿态")
+        # 张开 -> 微调闭合前姿态（已在 Phase 3 到位）
+        print("[GRAB] [Phase5] 1/3 张开夹爪并确认姿态")
         self.arm.set_gripper(90)
         time.sleep(0.3)
 
@@ -1652,27 +1743,27 @@ class AutoGrabWorkflow:
         ok = self._move_to_rz(final_r, final_z, "最终抓取姿态确认",
                               wait=1.0, target_pitch=params["grasp_pitch"])
         if not ok:
-            print("[GRAB] [Phase4] ⚠️ 最终姿态确认失败，尝试直接闭合")
+            print("[GRAB] [Phase5] ⚠️ 最终姿态确认失败，尝试直接闭合")
 
         # 夹紧
-        print("[GRAB] [Phase4] 2/3 夹紧")
+        print("[GRAB] [Phase5] 2/3 夹紧")
         self.arm.set_gripper(0)
         time.sleep(1.0)
 
         # 抬升
-        print("[GRAB] [Phase4] 3/3 抬升")
+        print("[GRAB] [Phase5] 3/3 抬升")
         for idx, (r, z, pitch) in enumerate(params["lift_trajectory"]):
             ok = self._move_to_rz(r, z, f"抬升路点 {idx+1}/{len(params['lift_trajectory'])}",
                                   wait=1.5, target_pitch=pitch)
             if not ok:
-                print(f"[GRAB] [Phase4] ⚠️ 抬升路点 {idx+1} 失败")
+                print(f"[GRAB] [Phase5] ⚠️ 抬升路点 {idx+1} 失败")
                 break
 
-        print("[GRAB] [Phase4] 抓取序列完成")
+        print("[GRAB] [Phase5] 抓取序列完成")
 
-        # 战果验证：本状态机已把语义终审放在 Phase 3，Phase 4 不再调用额外 VLM，
+        # 战果验证：本状态机已把语义终审放在 Phase 4，Phase 5 不再调用额外 VLM，
         # 仅依赖夹爪闭合反馈。如需增强验证，可在此调用 _verify_grab（消耗额外 VLM）。
-        return {"success": True, "message": "抓取并抬升完成（Phase 3 已终审通过）"}
+        return {"success": True, "message": "抓取并抬升完成（Phase 4 已终审通过）"}
 
     def _verify_grab(self, target_object: str) -> dict:
         """抓取后视觉验证（末端摄像头）"""
@@ -1737,11 +1828,12 @@ class AutoGrabWorkflow:
             print(f"[GRAB] [Cleanup] 清理旧目录失败: {e}")
 
     def run(self, target_object: str = "一包纸巾") -> dict:
-        """运行五阶段自主抓取状态机"""
+        """运行六阶段自主抓取状态机"""
         print(f"\n{'='*60}")
         print(f"[GRAB] 开始自主抓取: {target_object}")
         print(f"[GRAB] 末端摄像头: {'已启用' if self.use_end_camera else '未启用'}")
         print(f"[GRAB] OpenCV Tracker: {'可用' if _CV2_AVAILABLE else '不可用'}")
+        print(f"[GRAB] 3D 感知: {'已启用' if self._3d_enabled else '未启用'} ({self._3d_status_message})")
         print(f"[GRAB] VLM 调用: 不做硬限制，仅计数")
         print(f"[GRAB] 运动学: L1={_ARM_CFG.upper_arm_length}mm, L2={_ARM_CFG.forearm_length}mm")
         print(f"{'='*60}")
@@ -1773,32 +1865,20 @@ class AutoGrabWorkflow:
             self._phase0_observation_reset()
             return result
 
-        # Phase 2.5（支持回退到 Phase 2 重新对准）
-        for retry in range(2):
-            result = self._phase2_5_final_tuning(target_object)
-            if result.get("success"):
-                break
-            if result.get("retry_phase") == 2 and retry < 1:
-                print("[GRAB] [Main] Phase 2.5 漂移，回退到 Phase 2 重新对准")
-                r2 = self._phase2_approach_and_deploy(target_object)
-                if not r2.get("success"):
-                    self._phase0_observation_reset()
-                    return r2
-            else:
-                self._phase0_observation_reset()
-                return result
-        else:
-            self._phase0_observation_reset()
-            return {"success": False, "message": "Phase 2.5 多次尝试失败"}
-
-        # Phase 3
-        result = self._phase3_touch_verify(target_object)
+        # Phase 3: 二次距离闭环与精准贴紧
+        result = self._phase3_final_tuning(target_object)
         if not result.get("success"):
             self._phase0_observation_reset()
             return result
 
         # Phase 4
-        result = self._phase4_grasp_and_lift(target_object)
+        result = self._phase4_touch_verify(target_object)
+        if not result.get("success"):
+            self._phase0_observation_reset()
+            return result
+
+        # Phase 5
+        result = self._phase5_grasp_and_lift(target_object)
 
         print(f"\n{'='*60}")
         print(f"[GRAB] 最终结果: {result}")
@@ -1812,7 +1892,7 @@ class AutoGrabWorkflow:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="HomeBot 自主抓取工作流（五阶段状态机）")
+    parser = argparse.ArgumentParser(description="HomeBot 自主抓取工作流（六阶段状态机）")
     parser.add_argument("--ip", default=config.ROBOT_IP, help="机器人 IP")
     parser.add_argument("--video-port", type=int, default=config.VIDEO_PORT, help="机身摄像头端口")
     parser.add_argument("--end-video-port", type=int, default=config.END_VIDEO_PORT, help="末端摄像头端口")
