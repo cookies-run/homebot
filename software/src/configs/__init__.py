@@ -2,14 +2,14 @@
 """配置管理模块
 
 使用方式:
-    from configs import get_config, get_secrets, check_secrets
+    from configs import get_config, get_ai_credentials, check_ai_credentials
     
     # 获取配置
     config = get_config()
     print(config.chassis.serial_port)
     
     # 检查密钥配置状态
-    check_secrets()
+    check_ai_credentials()
 """
 from configs.config import (
     get_config,
@@ -29,15 +29,15 @@ from configs.config import (
     BatteryConfig,
 )
 
-from configs.secrets import (
-    get_secrets,
-    reload_secrets,
-    check_secrets,
-    require_secrets,
-    Secrets,
-    TTSSecrets,
-    LLMSecrets,
-    VisionSecrets,
+from configs.ai_config import (
+    get_ai_credentials,
+    reload_ai_credentials,
+    check_ai_credentials,
+    require_ai_credentials,
+    AICredentials,
+    TTSCredentials,
+    LLMCredentials,
+    VisionCredentials,
 )
 
 __all__ = [
@@ -58,12 +58,12 @@ __all__ = [
     "HumanFollowConfig",
     "BatteryConfig",
     # 密钥
-    "get_secrets",
-    "reload_secrets",
-    "check_secrets",
-    "require_secrets",
-    "Secrets",
-    "TTSSecrets",
-    "LLMSecrets",
-    "VisionSecrets",
+    "get_ai_credentials",
+    "reload_ai_credentials",
+    "check_ai_credentials",
+    "require_ai_credentials",
+    "AICredentials",
+    "TTSCredentials",
+    "LLMCredentials",
+    "VisionCredentials",
 ]

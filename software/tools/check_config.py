@@ -16,7 +16,7 @@ from pathlib import Path
 # 添加src到路径
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from configs import check_secrets, get_config
+from configs import check_ai_credentials, get_config
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
     print("\n[检查] HomeBot 配置检查\n")
     
     # 检查密钥
-    secrets_status = check_secrets(verbose=True)
+    secrets_status = check_ai_credentials(verbose=True)
     
     if args.secrets_only:
         # 检查是否所有必要密钥都已配置

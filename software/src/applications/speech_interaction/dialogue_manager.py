@@ -8,8 +8,8 @@ from typing import AsyncGenerator
 
 from common.logging import get_logger
 from configs.config import get_config
-from configs.secrets import require_secrets
-from openai import OpenAI
+from configs.ai_config import require_ai_credentials
+from services.llm_service.llm_client import get_llm_client
 
 logger = get_logger(__name__)
 
@@ -20,24 +20,21 @@ class DialogueManager:
     def __init__(self):
         """初始化对话管理器"""
         # 确保密钥已配置
-        require_secrets("llm")
+        require_ai_credentials("llm")
         
         llm_config = get_config().llm
         self.context = {
             "history": []
         }
         self.system_prompt = self._get_system_prompt()
-        
-        # 初始化 OpenAI 客户端
-        self.client = OpenAI(
-            api_key=llm_config.api_key,
-            base_url=llm_config.api_url
-        )
+
+        # 初始化 LLM 客户端（按配置懒加载）
+        self.llm_client = get_llm_client()
         self.model = llm_config.model
         self.temperature = llm_config.temperature
         self.max_tokens = llm_config.max_tokens
         self.top_p = getattr(llm_config, 'top_p', 0.9)
-        
+
         # MCP 相关 - 延迟初始化：仅在第一次对话时才初始化 MCP 客户端
         self.mcp_client = None
         self.mcp_tools = []
@@ -83,6 +80,13 @@ class DialogueManager:
 
 注意事项：
 - 用户语音可能有错别字，如"机械臂复位"识别成"机械臂服务"，请自主理解
+
+【递送任务 - 新增】
+当用户请求递送物品时（如"把XX递给YY"、"帮我把XX拿到YY"），必须按以下顺序调用工具：
+1. 调用 plan_delivery_task(user_request) 解析语义，获取确认话术。
+2. 向用户复述确认话术，等待用户明确确认。
+3. 用户确认后，调用 confirm_delivery_task(confirmed=true, grab_target, deliver_target) 执行预检查并启动递送。
+4. 执行过程中可调用 get_delivery_status() 查询状态。
 
 回复示例：
 - 用户说"机械臂抬高一点" → 你回复"好的"
@@ -142,15 +146,15 @@ class DialogueManager:
     
     def _call_llm_api(self, messages: list) -> dict:
         """调用 LLM API
-        
+
         Args:
             messages: 对话历史消息列表
-        
+
         Returns:
             dict: LLM API 返回结果
         """
         try:
-            response = self.client.chat.completions.create(
+            response = self.llm_client.chat_completion(
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
@@ -158,34 +162,8 @@ class DialogueManager:
                 top_p=self.top_p,
                 tools=self.mcp_tools if self.mcp_tools else None,
                 tool_choice="auto" if self.mcp_tools else None,
-                extra_body={"thinking": {"type": "disabled"}}  # 显式禁用思考功能，提升响应速度
             )
-            
-            # 转换为统一格式
-            response_dict = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": response.choices[0].message.content,
-                            "tool_calls": []
-                        }
-                    }
-                ]
-            }
-            
-            # 添加工具调用信息
-            if response.choices[0].message.tool_calls:
-                for tool_call in response.choices[0].message.tool_calls:
-                    response_dict["choices"][0]["message"]["tool_calls"].append({
-                        "id": tool_call.id,
-                        "type": tool_call.type,
-                        "function": {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments
-                        }
-                    })
-            
-            return response_dict
+            return response
         except Exception as e:
             logger.error(f"LLM API调用异常: {e}")
             return {}

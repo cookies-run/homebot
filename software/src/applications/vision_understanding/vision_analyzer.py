@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 from services.vision_service.vision import VisionSubscriber
 from common.logging import get_logger
-from configs.secrets import get_secrets
+from configs.ai_config import get_ai_credentials
 
 logger = get_logger(__name__)
 
@@ -34,6 +34,10 @@ DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 
 # 默认 MiniMax 配置
 DEFAULT_MINIMAX_API_HOST = "https://api.minimaxi.com"
+
+# 默认 OpenAI 配置
+DEFAULT_OPENAI_MODEL = "gpt-4o"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 class VisionAnalyzer:
@@ -64,7 +68,7 @@ class VisionAnalyzer:
 
         # 提供商选择
         self.provider = os.getenv("VISION_PROVIDER", "minimax")
-        secrets = get_secrets()
+        secrets = get_ai_credentials()
 
         # ---------- MiniMax 配置 ----------
         self.minimax_api_key = api_key or os.getenv("MINIMAX_API_KEY", "")
@@ -91,6 +95,31 @@ class VisionAnalyzer:
         self.ark_base_url = base_url or os.getenv("ARK_BASE_URL", DEFAULT_ARK_BASE_URL)
         if secrets.vision.api_url:
             self.ark_base_url = secrets.vision.api_url
+
+        # ---------- OpenAI 配置 ----------
+        self.openai_api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+        if not self.openai_api_key and secrets.vision.api_key:
+            self.openai_api_key = secrets.vision.api_key
+        if not self.openai_api_key and secrets.llm.api_key:
+            self.openai_api_key = secrets.llm.api_key
+
+        self.openai_base_url = base_url or os.getenv("OPENAI_API_URL", "")
+        if not self.openai_base_url and secrets.vision.api_url:
+            self.openai_base_url = secrets.vision.api_url
+        if not self.openai_base_url:
+            self.openai_base_url = DEFAULT_OPENAI_BASE_URL
+
+        # 统一模型名称
+        if self.provider == "minimax":
+            self.model = model or ""
+        elif self.provider == "openai":
+            self.model = model or os.getenv("OPENAI_MODEL", "")
+            if not self.model and secrets.vision.model:
+                self.model = secrets.vision.model
+            if not self.model:
+                self.model = DEFAULT_OPENAI_MODEL
+        else:
+            self.model = self.ark_model
 
         # 视频订阅器
         self._subscriber: Optional[VisionSubscriber] = None
@@ -192,6 +221,8 @@ class VisionAnalyzer:
 
         if self.provider == "minimax":
             return self._analyze_minimax(image_path, prompt)
+        elif self.provider == "openai":
+            return self._analyze_openai(image_path, prompt, max_tokens)
         else:
             return self._analyze_ark(image_path, prompt, max_tokens)
 
@@ -343,7 +374,78 @@ class VisionAnalyzer:
                 "status": "error",
                 "message": f"图像分析失败: {e}"
             }
-    
+
+    def _analyze_openai(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 4096
+    ) -> Dict[str, Any]:
+        """调用 OpenAI GPT-4V/GPT-4o 分析图片
+
+        Args:
+            image_path: 图片文件路径
+            prompt: 对图片的提问或指令
+            max_tokens: 最大输出 token 数
+
+        Returns:
+            包含状态和结果的字典
+        """
+        if not self.openai_api_key:
+            return {
+                "status": "error",
+                "message": "OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量，或在 .env.local 中配置 VISION_API_KEY"
+            }
+
+        try:
+            from services.llm_service.llm_client import OpenAIOfficialClient
+
+            client = OpenAIOfficialClient(
+                api_key=self.openai_api_key,
+                base_url=self.openai_base_url,
+            )
+
+            base64_image = self.encode_image(image_path)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ]
+
+            logger.info(f"Sending analysis request to OpenAI, model={self.model}")
+            response = client.chat_completion(
+                model=self.model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                top_p=0.9,
+            )
+
+            result_text = response["choices"][0]["message"]["content"]
+            logger.info("OpenAI analysis completed successfully")
+
+            return {
+                "status": "success",
+                "description": result_text,
+                "image_path": image_path
+            }
+
+        except Exception as e:
+            logger.error(f"OpenAI analysis failed: {e}")
+            return {
+                "status": "error",
+                "message": f"图像分析失败: {e}"
+            }
+
     def capture_and_analyze(
         self,
         prompt: str = "请描述这张图片的内容",
