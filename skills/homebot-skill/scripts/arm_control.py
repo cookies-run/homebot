@@ -19,9 +19,9 @@ import zmq
 from typing import Dict, Optional
 from dataclasses import dataclass
 
+from robot_config import ROBOT_IP, ARM_PORT
+
 # ============ 配置 ============
-ROBOT_IP = "127.0.0.1"
-ROBOT_PORT = 5557  # 与HomeBot配置一致: arm_service_addr = "tcp://*:5557"
 DEFAULT_SOURCE = "picoclaw"
 DEFAULT_PRIORITY = 2
 DEFAULT_SPEED = 1000
@@ -71,11 +71,11 @@ class HomeBotArmController:
     }
     """
     
-    def __init__(self, service_addr: str = None, timeout_ms: int = 3000, 
-                 robot_ip: str = ROBOT_IP, robot_port: int = ROBOT_PORT):
+    def __init__(self, service_addr: str = None, timeout_ms: int = 3000,
+                 robot_ip: str = ROBOT_IP, robot_port: int = ARM_PORT):
         """
         初始化客户端
-        
+
         Args:
             service_addr: 机械臂服务ZeroMQ地址 (例如 tcp://192.168.0.12:5557)
             timeout_ms: 请求超时时间
@@ -256,7 +256,7 @@ def print_response(response: Optional[ArbiterResponse]):
 def main():
     parser = argparse.ArgumentParser(description="HomeBot机械臂控制器")
     parser.add_argument("--ip", default=ROBOT_IP, help=f"机器人IP地址 (默认: {ROBOT_IP})")
-    parser.add_argument("--port", type=int, default=ROBOT_PORT, help=f"ZeroMQ端口 (默认: {ROBOT_PORT})")
+    parser.add_argument("--port", type=int, default=ARM_PORT, help=f"ZeroMQ端口 (默认: {ARM_PORT})")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 

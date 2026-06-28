@@ -1,0 +1,6 @@
+# Local camera calibration results; these are robot-specific and should not be committed.
+# Generate with:
+#   python -m software.tools.calibrate_end_camera
+#   python -m software.tools.calibrate_body_camera
+*
+!.gitignore

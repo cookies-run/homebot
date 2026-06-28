@@ -85,7 +85,7 @@ class TTSCredentials:
 @dataclass
 class LLMCredentials:
     """LLM 服务配置"""
-    provider: str = ""                        # 提供商: minimax/volcano/deepseek/openai/qwen
+    provider: str = ""                        # 提供商: cctq/minimax/volcano/deepseek/openai/qwen
     api_key: str = ""
     api_url: str = ""                         # 空时由 LLMConfig 按 provider 填充默认值
     model: str = ""  # 火山Ark需要填写模型ID，如 ep-20250324123456-abcdef
@@ -423,7 +423,7 @@ class LLMConfig:
     支持火山Ark、DeepSeek、MiniMax 等 OpenAI 兼容接口
     如需修改，请在 .env.local 文件中设置
     """
-    provider: str = "minimax"                 # 提供商: minimax/volcano/deepseek/qwen/openai
+    provider: str = "minimax"                 # 提供商: cctq/minimax/volcano/deepseek/qwen/openai
     api_key: str = ""                         # API密钥
     api_url: str = ""                         # API地址（空时按 provider 使用默认值）
     model: str = ""                           # 模型名称
@@ -450,6 +450,7 @@ class LLMConfig:
         if not self.api_url:
             provider_defaults = {
                 "openai": "https://api.openai.com/v1",
+                "cctq": "https://www.cctq.ai/v1",
                 "minimax": "https://api.minimax.chat/v1",
                 "volcano": "https://ark.cn-beijing.volces.com/api/v3",
                 "ark": "https://ark.cn-beijing.volces.com/api/v3",
@@ -463,6 +464,7 @@ class LLMConfig:
             # 避免切换 provider 时，旧的通用 LLM_API_URL 指向另一家平台导致请求失败
             provider_defaults = {
                 "openai": "https://api.openai.com/v1",
+                "cctq": "https://www.cctq.ai/v1",
                 "minimax": "https://api.minimax.chat/v1",
                 "volcano": "https://ark.cn-beijing.volces.com/api/v3",
                 "ark": "https://ark.cn-beijing.volces.com/api/v3",

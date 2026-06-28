@@ -13,17 +13,16 @@ import sys
 import time
 from typing import Optional
 
-# Configuration - Modify this for your robot
-ROBOT_IP = "127.0.0.1"
-ROBOT_PORT = 5556
+from robot_config import ROBOT_IP, CHASSIS_PORT
+
 DEFAULT_SPEED = 0.3       # m/s
 DEFAULT_ANGULAR_SPEED = 0.5  # rad/s
 
 
 class HomeBotChassisController:
     """HomeBot机器人控制器"""
-    
-    def __init__(self, service_addr: str = None, ip: str = ROBOT_IP, port: int = ROBOT_PORT):
+
+    def __init__(self, service_addr: str = None, ip: str = ROBOT_IP, port: int = CHASSIS_PORT):
         """
         初始化底盘控制器
         

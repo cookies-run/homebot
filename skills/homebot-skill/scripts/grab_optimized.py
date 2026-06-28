@@ -63,16 +63,16 @@ try:
 except ImportError as e:
     print(f"[GRAB] [WARN] camera_geometry 不可用: {e}")
 
-# 视觉分析客户端优先级：MiniMax -> MiMo -> 火山引擎
+# 视觉分析客户端优先级：cctq(gpt-5.5) -> MiniMax -> 火山引擎
 _AVAILABLE_VLM = []
 try:
-    from minimax_vision_client import analyze_images_m3 as _minimax_analyze
-    _AVAILABLE_VLM.append(("minimax", _minimax_analyze))
+    from cctq_vision_client import analyze_images as _cctq_analyze
+    _AVAILABLE_VLM.append(("cctq", _cctq_analyze))
 except ImportError:
     pass
 try:
-    from mimo_vision_client import analyze_images as _mimo_analyze
-    _AVAILABLE_VLM.append(("mimo", _mimo_analyze))
+    from minimax_vision_client import analyze_images_m3 as _minimax_analyze
+    _AVAILABLE_VLM.append(("minimax", _minimax_analyze))
 except ImportError:
     pass
 try:
@@ -86,14 +86,6 @@ if not _AVAILABLE_VLM:
     print("[WARN] 未找到视觉分析客户端，抓取功能将不可用")
 
 
-def _is_quota_error(provider: str, error: Exception) -> bool:
-    """判断是否为 Token Plan / 用量上限类错误，需要触发 fallback"""
-    if provider != "minimax":
-        return False
-    err_str = str(error).lower()
-    return any(k in err_str for k in ["2056", "token plan", "用量上限", "quota exceeded", "rate limit"])
-
-
 def analyze_images_with_fallback(
     image_paths: list,
     prompt: str,
@@ -102,7 +94,7 @@ def analyze_images_with_fallback(
     timeout: int = 60,
 ) -> tuple[str, str]:
     """
-    按优先级调用 VLM，当 MiniMax 达到 Token Plan 用量上限时自动回退到 MiMo / 火山引擎。
+    按优先级调用 VLM：首选 cctq(gpt-5.5)，失败时依次回退到 MiniMax / 火山引擎。
 
     Returns:
         (text_result, provider_name)
@@ -130,13 +122,9 @@ def analyze_images_with_fallback(
             print(f"[GRAB] VLM({name}) 调用成功")
             return result, name
         except Exception as e:
-            err_str = str(e)
-            print(f"[GRAB] VLM({name}) 调用失败: {err_str}")
+            print(f"[GRAB] VLM({name}) 调用失败: {e}，尝试下一个 provider")
             last_err = e
-            if _is_quota_error(name, e):
-                print(f"[GRAB] VLM({name}) 触发 quota 上限 fallback，尝试下一个 provider")
-                continue
-            break
+            continue
     raise last_err or RuntimeError("所有 VLM provider 均失败")
 
 import robot_config as config

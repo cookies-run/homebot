@@ -39,11 +39,16 @@ DEFAULT_MINIMAX_API_HOST = "https://api.minimaxi.com"
 DEFAULT_OPENAI_MODEL = "gpt-4o"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
+# 默认 cctq.ai (gpt-5.5) 配置
+DEFAULT_CCTQ_MODEL = "gpt-5.5"
+DEFAULT_CCTQ_BASE_URL = "https://www.cctq.ai/v1"
+
 
 class VisionAnalyzer:
     """视觉分析器 - 捕获视频帧并进行 AI 分析
 
-    支持多提供商：MiniMax / 火山Ark，通过 VISION_PROVIDER 环境变量切换。
+    支持多提供商：cctq(gpt-5.5) / MiniMax / 火山Ark / OpenAI，通过 VISION_PROVIDER
+    环境变量切换。provider=cctq 时以 gpt-5.5 为主，失败自动回退 MiniMax。
     """
 
     def __init__(
@@ -67,7 +72,7 @@ class VisionAnalyzer:
         self.timeout_ms = timeout_ms
 
         # 提供商选择
-        self.provider = os.getenv("VISION_PROVIDER", "minimax")
+        self.provider = os.getenv("VISION_PROVIDER", "cctq")
         secrets = get_ai_credentials()
 
         # ---------- MiniMax 配置 ----------
@@ -109,9 +114,31 @@ class VisionAnalyzer:
         if not self.openai_base_url:
             self.openai_base_url = DEFAULT_OPENAI_BASE_URL
 
+        # ---------- cctq.ai (gpt-5.5) 配置 ----------
+        self.cctq_api_key = (
+            api_key
+            or os.getenv("CCTQ_API_KEY", "")
+            or os.getenv("LLM_API_KEY", "")
+            or secrets.llm.api_key
+        )
+        self.cctq_base_url = (
+            base_url
+            or os.getenv("CCTQ_API_URL", "")
+            or os.getenv("LLM_API_URL", "")
+            or DEFAULT_CCTQ_BASE_URL
+        )
+        self.cctq_model = (
+            model
+            or os.getenv("CCTQ_VISION_MODEL", "")
+            or os.getenv("LLM_MODEL", "")
+            or DEFAULT_CCTQ_MODEL
+        )
+
         # 统一模型名称
         if self.provider == "minimax":
             self.model = model or ""
+        elif self.provider == "cctq":
+            self.model = self.cctq_model
         elif self.provider == "openai":
             self.model = model or os.getenv("OPENAI_MODEL", "")
             if not self.model and secrets.vision.model:
@@ -219,7 +246,13 @@ class VisionAnalyzer:
                 "message": f"图片文件不存在: {image_path}"
             }
 
-        if self.provider == "minimax":
+        if self.provider == "cctq":
+            result = self._analyze_cctq(image_path, prompt, max_tokens)
+            if result.get("status") != "success":
+                logger.warning(f"cctq(gpt-5.5) 视觉分析失败，回退 MiniMax: {result.get('message')}")
+                return self._analyze_minimax(image_path, prompt)
+            return result
+        elif self.provider == "minimax":
             return self._analyze_minimax(image_path, prompt)
         elif self.provider == "openai":
             return self._analyze_openai(image_path, prompt, max_tokens)
@@ -375,35 +408,40 @@ class VisionAnalyzer:
                 "message": f"图像分析失败: {e}"
             }
 
-    def _analyze_openai(
+    def _analyze_openai_compatible(
         self,
         image_path: str,
         prompt: str,
-        max_tokens: int = 4096
+        max_tokens: int,
+        api_key: str,
+        base_url: str,
+        model: str,
+        label: str,
     ) -> Dict[str, Any]:
-        """调用 OpenAI GPT-4V/GPT-4o 分析图片
+        """调用 OpenAI 兼容接口（OpenAI 官方 / cctq.ai 等）分析图片
 
         Args:
             image_path: 图片文件路径
             prompt: 对图片的提问或指令
             max_tokens: 最大输出 token 数
+            api_key: API 密钥
+            base_url: API 基础 URL
+            model: 模型名称
+            label: 日志/错误信息中显示的提供商名
 
         Returns:
             包含状态和结果的字典
         """
-        if not self.openai_api_key:
+        if not api_key:
             return {
                 "status": "error",
-                "message": "OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量，或在 .env.local 中配置 VISION_API_KEY"
+                "message": f"{label} API Key 未配置，请在 .env.local 中配置对应密钥"
             }
 
         try:
             from services.llm_service.llm_client import OpenAIOfficialClient
 
-            client = OpenAIOfficialClient(
-                api_key=self.openai_api_key,
-                base_url=self.openai_base_url,
-            )
+            client = OpenAIOfficialClient(api_key=api_key, base_url=base_url)
 
             base64_image = self.encode_image(image_path)
             messages = [
@@ -421,9 +459,9 @@ class VisionAnalyzer:
                 }
             ]
 
-            logger.info(f"Sending analysis request to OpenAI, model={self.model}")
+            logger.info(f"Sending analysis request to {label}, model={model}")
             response = client.chat_completion(
-                model=self.model,
+                model=model,
                 messages=messages,
                 temperature=0.1,
                 max_tokens=max_tokens,
@@ -431,7 +469,7 @@ class VisionAnalyzer:
             )
 
             result_text = response["choices"][0]["message"]["content"]
-            logger.info("OpenAI analysis completed successfully")
+            logger.info(f"{label} analysis completed successfully")
 
             return {
                 "status": "success",
@@ -440,11 +478,41 @@ class VisionAnalyzer:
             }
 
         except Exception as e:
-            logger.error(f"OpenAI analysis failed: {e}")
+            logger.error(f"{label} analysis failed: {e}")
             return {
                 "status": "error",
                 "message": f"图像分析失败: {e}"
             }
+
+    def _analyze_cctq(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 4096
+    ) -> Dict[str, Any]:
+        """调用 cctq.ai gpt-5.5 多模态模型分析图片"""
+        return self._analyze_openai_compatible(
+            image_path, prompt, max_tokens,
+            api_key=self.cctq_api_key,
+            base_url=self.cctq_base_url,
+            model=self.cctq_model,
+            label="cctq(gpt-5.5)",
+        )
+
+    def _analyze_openai(
+        self,
+        image_path: str,
+        prompt: str,
+        max_tokens: int = 4096
+    ) -> Dict[str, Any]:
+        """调用 OpenAI GPT-4V/GPT-4o 分析图片"""
+        return self._analyze_openai_compatible(
+            image_path, prompt, max_tokens,
+            api_key=self.openai_api_key,
+            base_url=self.openai_base_url,
+            model=self.model,
+            label="OpenAI",
+        )
 
     def capture_and_analyze(
         self,

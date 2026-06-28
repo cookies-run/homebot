@@ -23,7 +23,8 @@
 import os
 
 # 机器人IP地址 - 可通过 HOMEBOT_IP 环境变量覆盖
-ROBOT_IP = os.getenv("HOMEBOT_IP", "127.0.0.1")
+# 默认使用常见局域网地址 192.168.1.13；如果本地调试可设置 HOMEBOT_IP=127.0.0.1
+ROBOT_IP = os.getenv("HOMEBOT_IP", "192.168.1.13")
 
 # ZeroMQ 端口配置 - 可通过环境变量覆盖
 # 当前系统实际配置：5560=机身主摄像头，5561=机械臂末端摄像头
