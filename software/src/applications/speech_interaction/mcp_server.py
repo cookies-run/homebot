@@ -39,30 +39,8 @@ except ImportError as e:
     _AUTO_GRAB_AVAILABLE = False
     logger.warning(f"AutoGrabWorkflow 导入失败: {e}")
 
-# ---------- 导入递送智能体（新增，不修改原有逻辑）----------
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-    from applications.delivery_agent import DeliveryAgent, DeliveryAgentConfig
-    _DELIVERY_AGENT_AVAILABLE = True
-    logger.info("DeliveryAgent 导入成功")
-except ImportError as e:
-    _DELIVERY_AGENT_AVAILABLE = False
-    logger.warning(f"DeliveryAgent 导入失败: {e}")
-
-# 全局递送智能体实例（惰性初始化）
-_delivery_agent: Optional[DeliveryAgent] = None
-
-
-def _get_delivery_agent() -> Optional[DeliveryAgent]:
-    """获取递送智能体实例（新增）"""
-    global _delivery_agent
-    if _delivery_agent is None and _DELIVERY_AGENT_AVAILABLE:
-        try:
-            _delivery_agent = DeliveryAgent(DeliveryAgentConfig.from_env())
-            logger.info("递送智能体初始化成功")
-        except Exception as e:
-            logger.error(f"递送智能体初始化失败: {e}")
-    return _delivery_agent
+# 递送任务拆解已上移到调用侧 LLM，Python 侧不再做语义解析。
+# 细粒度技能（如 search_target）通过 skills/homebot-skill/mcp_homebot_server.py 暴露。
 
 # 创建全局 FastMCP 服务器实例
 mcp = FastMCP("HomeBot Voice Interaction MCP Server")
@@ -2031,62 +2009,11 @@ def get_human_follow_status() -> dict:
         }
 
 
-# ==================== 递送任务工具（新增，不修改原有工具）====================
+# ==================== 递送任务工具（已移除）====================
+# 递送的任务拆解已上移到调用侧 LLM，plan_delivery_task / confirm_delivery_task
+# 两个双层 LLM 工具已退休。请改用 skills/homebot-skill/mcp_homebot_server.py 暴露的
+# 细粒度技能（search_target / auto_grab 等）。
 
-@mcp.tool
-def plan_delivery_task(user_request: str) -> dict:
-    """规划递送任务。
-
-    当用户说"把XX递给YY"、"帮我把XX拿到YY"等递送类请求时，调用此工具。
-    它会解析用户语义，提取抓取目标和递送目标，并生成确认话术。
-
-    Args:
-        user_request: 用户的原始请求文本
-
-    Returns:
-        解析结果和确认话术
-    """
-    try:
-        agent = _get_delivery_agent()
-        if agent is None:
-            return {"status": "error", "message": "递送智能体不可用"}
-        result = agent.process_user_request(user_request)
-        return {"status": "success", "data": result}
-    except Exception as e:
-        logger.error(f"规划递送任务失败: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-@mcp.tool
-def confirm_delivery_task(confirmed: bool, grab_target: str = "", deliver_target: str = "") -> dict:
-    """确认并开始执行递送任务。
-
-    用户在 plan_delivery_task 后表示确认时调用。会先执行预检查
-    （搜索抓取目标、判断可抓取性、确认递送目标在附近），通过后启动执行。
-
-    Args:
-        confirmed: 用户是否确认
-        grab_target: 抓取目标
-        deliver_target: 递送目标
-
-    Returns:
-        执行启动结果
-    """
-    try:
-        agent = _get_delivery_agent()
-        if agent is None:
-            return {"status": "error", "message": "递送智能体不可用"}
-        # 如果 agent 当前状态与传入目标不一致，更新状态
-        state = agent.state.get()
-        if state.grab_target != grab_target:
-            agent.state.update(grab_target=grab_target)
-        if state.deliver_target != deliver_target:
-            agent.state.update(deliver_target=deliver_target)
-        result = agent.process_confirmation(confirmed)
-        return {"status": "success", "data": result}
-    except Exception as e:
-        logger.error(f"确认递送任务失败: {e}")
-        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool

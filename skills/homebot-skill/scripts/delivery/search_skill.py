@@ -60,6 +60,49 @@ class SearchSkill:
 
         return {"found": False, "reason": "多次尝试未在画面中找到目标"}
 
+    def search_with_scan(self, target: str, rotate_fn, rotate_deg: float = 120.0,
+                         max_scans: int = 3, settle_s: float = 0.6) -> dict:
+        """原地旋转扫描搜索单个目标。
+
+        在当前朝向搜索一次，找不到则调用 rotate_fn 旋转后再搜，最多 max_scans 次
+        （默认 3 次 * 120° = 转满一圈）。旋转由外部注入以解耦底盘实现。
+
+        Args:
+            target: 目标描述
+            rotate_fn: 无参回调，执行一次底盘旋转（角度由调用方绑定）
+            rotate_deg: 单次旋转角度，仅用于结果记录
+            max_scans: 最大扫描次数
+            settle_s: 旋转后等待画面稳定的秒数
+
+        Returns:
+            {
+                "found": bool,
+                "scans_used": int,
+                "bbox": [...], "height_cm": float, "pose": str,
+                "graspable": bool,
+                "reason": str
+            }
+        """
+        for i in range(max_scans):
+            result = self.search(target)
+            if result.get("found"):
+                result["graspable"] = self.check_graspable(result).get("graspable", False)
+                result["scans_used"] = i + 1
+                return result
+            if i < max_scans - 1:
+                try:
+                    rotate_fn()
+                except Exception as e:
+                    logger.error(f"旋转失败，中止扫描: {e}")
+                    return {"found": False, "scans_used": i + 1, "reason": f"旋转失败: {e}"}
+                time.sleep(settle_s)
+
+        return {
+            "found": False,
+            "scans_used": max_scans,
+            "reason": f"旋转扫描 {max_scans} 次（约 {rotate_deg * max_scans:.0f}°）未找到目标",
+        }
+
     def _call_vlm(self, image_path: str, target: str) -> Optional[dict]:
         """调用 VLM 搜索目标。"""
         prompt = f'''你是机器人的高精度视觉定位助手。请在图片中找到目标物体"{target}"，并只返回以下 JSON：

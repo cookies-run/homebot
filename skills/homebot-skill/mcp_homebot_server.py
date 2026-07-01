@@ -15,14 +15,20 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/scripts")
 
-# 尝试导入递送智能体（依赖 software/src 中的应用层运行时）
+# 细粒度确定性技能（查找 / 接近 / 递送）。
+# 任务拆解与整体编排上移到 openclaw，Python 侧仅暴露每一步的原子能力，
+# 并在每一步返回结构化反馈，由 openclaw 决定下一步。
 try:
     sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../../software/src")
-    from applications.delivery_agent import DeliveryAgent, DeliveryAgentConfig
-    _DELIVERY_AVAILABLE = True
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/scripts/delivery")
+    from adapters import VisionAdapter, ChassisAdapter, ArmAdapter
+    from search_skill import SearchSkill
+    from approach_skill import ApproachSkill
+    from place_skill import PlaceSkill
+    _SKILLS_AVAILABLE = True
 except Exception as e:
-    print(f"[WARNING] 递送智能体导入失败: {e}")
-    _DELIVERY_AVAILABLE = False
+    print(f"[WARNING] 递送技能导入失败: {e}")
+    _SKILLS_AVAILABLE = False
 
 from scripts.chassis_control import HomeBotChassisController
 from scripts.arm_control import HomeBotArmController
@@ -35,6 +41,9 @@ from scripts.robot_config import ROBOT_IP, CHASSIS_PORT, ARM_PORT, VIDEO_PORT
 # -----------------------------------------------------------------------------
 # 机器人可达性检测
 # -----------------------------------------------------------------------------
+SKIP_REACHABILITY_CHECK = os.getenv("HOMEBOT_SKIP_REACHABILITY_CHECK", "false").lower() in ("1", "true", "yes")
+
+
 async def check_robot_reachable(
     ip: str = ROBOT_IP,
     ports: list[int] | None = None,
@@ -48,23 +57,35 @@ async def check_robot_reachable(
     if ports is None:
         ports = [CHASSIS_PORT, ARM_PORT, VIDEO_PORT]
 
-    async def _try_connect(port: int) -> bool:
+    print(f"[HomeBot] 正在检测机器人可达性: ip={ip}, ports={ports}, timeout={timeout}s")
+
+    async def _try_connect(port: int) -> tuple[int, bool]:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, port), timeout=timeout
             )
             writer.close()
             await writer.wait_closed()
-            return True
-        except Exception:
-            return False
+            print(f"[HomeBot] 端口 {port} 可连接")
+            return port, True
+        except asyncio.TimeoutError:
+            print(f"[HomeBot] 端口 {port} 连接超时")
+            return port, False
+        except OSError as e:
+            print(f"[HomeBot] 端口 {port} 连接失败: {e}")
+            return port, False
+        except Exception as e:
+            print(f"[HomeBot] 端口 {port} 检测异常: {e}")
+            return port, False
 
     results = await asyncio.gather(*(_try_connect(p) for p in ports))
-    if any(results):
+    reachable_ports = [port for port, ok in results if ok]
+    if reachable_ports:
+        print(f"[HomeBot] 可达端口: {reachable_ports}")
         return True, ""
 
     tips = (
-        f"❌ 无法连接到机器人服务（当前 IP: {ip}）。\n"
+        f"❌ 无法连接到机器人服务（当前 IP: {ip}，检测端口: {ports}）。\n"
         f"请确认以下问题后再试：\n"
         f"1. 机器人已开机并连接到同一局域网；\n"
         f"2. 机器人后台服务已启动（运动、机械臂、视觉服务）；\n"
@@ -73,24 +94,35 @@ async def check_robot_reachable(
         f"  • 设置环境变量：export HOMEBOT_IP=你的机器人IP\n"
         f"  • 在 OpenClaw / Claude Code MCP 配置的 env 中设置 HOMEBOT_IP\n"
         f"  • 修改 scripts/robot_config.py 中的 ROBOT_IP 默认值\n\n"
+        f"如果确定网络已通但仍被误拦，可设置 HOMEBOT_SKIP_REACHABILITY_CHECK=1 跳过检测。\n\n"
         f"也可先用 ping {ip} 测试网络连通性。"
     )
     return False, tips
 
 
-# 缓存最近一次检测结果，避免同一轮对话中重复检测
+# 缓存最近一次成功检测结果，避免同一轮对话中重复检测；失败不缓存，方便用户修复后重试
 _last_reachable: bool | None = None
 _last_check_ip: str | None = None
 
 
 async def ensure_robot_reachable(ports: list[int] | None = None) -> tuple[bool, str]:
     """带缓存的可达性检测，供工具入口统一调用。"""
+    if SKIP_REACHABILITY_CHECK:
+        print("[HomeBot] 已跳过机器人可达性检测（HOMEBOT_SKIP_REACHABILITY_CHECK=1）")
+        return True, ""
+
     global _last_reachable, _last_check_ip
     if _last_reachable is True and _last_check_ip == ROBOT_IP:
+        print("[HomeBot] 使用缓存的可达性检测结果")
         return True, ""
     reachable, msg = await check_robot_reachable(ports=ports)
-    _last_reachable = reachable
-    _last_check_ip = ROBOT_IP
+    if reachable:
+        _last_reachable = True
+        _last_check_ip = ROBOT_IP
+    else:
+        # 失败不缓存，方便服务恢复后直接重试
+        _last_reachable = False
+        _last_check_ip = None
     return reachable, msg
 
 # 优先 MiniMax VLM，回退火山引擎
@@ -254,119 +286,194 @@ async def auto_grab(
         return f"❌ 抓取异常: {e}"
 
 
-# 全局递送智能体实例（惰性初始化）
-_delivery_agent = None
+# 细粒度技能实例（惰性初始化，跨工具复用同一视觉订阅与底盘/机械臂适配器）
+_vision_adapter = None
+_search_skill = None
+_approach_skill = None
+_place_skill = None
+_chassis_adapter = None
+_arm_adapter = None
+
+# 面积-距离标定基准：目标框归一化面积约 0.08 时距离约 30cm。
+# 期望距离 D 处的停止面积按平方反比缩放 area = 0.08 * (30/D)^2。
+# 这是基于框面积的粗估，非真实深度；后续手眼外参标定后会替换。
+_AREA_AT_30CM = 0.08
 
 
-def _get_delivery_agent() -> "DeliveryAgent | None":
-    """获取递送智能体实例。"""
-    global _delivery_agent
-    if _delivery_agent is None and _DELIVERY_AVAILABLE:
+def _get_vision_adapter() -> "VisionAdapter | None":
+    """获取共享视觉订阅适配器。"""
+    global _vision_adapter
+    if _vision_adapter is None and _SKILLS_AVAILABLE:
         try:
-            _delivery_agent = DeliveryAgent(DeliveryAgentConfig.from_env())
+            _vision_adapter = VisionAdapter(f"tcp://{ROBOT_IP}:{VIDEO_PORT}")
         except Exception as e:
-            print(f"[WARNING] 递送智能体初始化失败: {e}")
-    return _delivery_agent
+            print(f"[WARNING] 视觉适配器初始化失败: {e}")
+    return _vision_adapter
+
+
+def _get_search_skill() -> "SearchSkill | None":
+    """获取搜索技能实例（复用共享视觉订阅）。"""
+    global _search_skill
+    if _search_skill is None and _SKILLS_AVAILABLE:
+        va = _get_vision_adapter()
+        if va is not None:
+            _search_skill = SearchSkill(va)
+    return _search_skill
+
+
+def _get_approach_skill() -> "ApproachSkill | None":
+    """获取接近技能实例（底盘速度 PID + 共享视觉订阅）。"""
+    global _approach_skill, _chassis_adapter
+    if _approach_skill is None and _SKILLS_AVAILABLE:
+        try:
+            va = _get_vision_adapter()
+            if _chassis_adapter is None:
+                _chassis_adapter = ChassisAdapter(f"tcp://{ROBOT_IP}:{CHASSIS_PORT}")
+            if va is not None:
+                _approach_skill = ApproachSkill(_chassis_adapter, va)
+        except Exception as e:
+            print(f"[WARNING] 接近技能初始化失败: {e}")
+    return _approach_skill
+
+
+def _get_place_skill() -> "PlaceSkill | None":
+    """获取递送/放置技能实例（机械臂适配器）。"""
+    global _place_skill, _arm_adapter
+    if _place_skill is None and _SKILLS_AVAILABLE:
+        try:
+            if _arm_adapter is None:
+                _arm_adapter = ArmAdapter(f"tcp://{ROBOT_IP}:{ARM_PORT}")
+            _place_skill = PlaceSkill(_arm_adapter, _get_vision_adapter())
+        except Exception as e:
+            print(f"[WARNING] 递送技能初始化失败: {e}")
+    return _place_skill
 
 
 @mcp.tool()
-async def delivery_plan(user_request: str = Field(description="用户的递送请求文本，例如'把矿泉水递给穿红衣服的人'")) -> str:
-    """解析用户递送请求，提取抓取目标和递送目标，并生成确认话术。
-
-    当用户说"把XX递给YY"、"帮我把XX拿到YY"等递送类请求时，先调用此工具。
-    工具返回向用户确认的话术，需要用户明确同意后，再调用 delivery_confirm。
-    """
-    reachable, msg = await ensure_robot_reachable(ports=[CHASSIS_PORT, ARM_PORT, VIDEO_PORT])
-    if not reachable:
-        return msg
-    agent = _get_delivery_agent()
-    if agent is None:
-        return "❌ 递送智能体不可用"
-    try:
-        result = agent.process_user_request(user_request)
-        if result.get("action") == "parse":
-            return (
-                f"✅ 已解析递送请求\n"
-                f"抓取目标: {result.get('grab_target')}\n"
-                f"递送目标: {result.get('deliver_target')}\n"
-                f"确认话术: {result.get('message')}"
-            )
-        return f"❌ 解析失败: {result.get('message', '未知错误')}"
-    except Exception as e:
-        return f"❌ 规划递送任务失败: {e}"
-
-
-@mcp.tool()
-async def delivery_confirm(
-    confirmed: bool = Field(description="用户是否确认执行递送任务"),
-    grab_target: str = Field(default="", description="抓取目标，例如'矿泉水'"),
-    deliver_target: str = Field(default="", description="递送目标，例如'穿红衣服的人'"),
+async def search_target(
+    target: str = Field(description="要寻找的单个目标描述，例如'一包纸巾'、'穿黑色上衣的人'、'桌上的矿泉水瓶'")
 ) -> str:
-    """用户确认后执行预检查并启动递送任务。
+    """旋转扫描寻找单个目标，返回其在画面中的位置(bbox)。
 
-    在 delivery_plan 之后，如果用户明确同意（如说"对"、"是的"、"好"），调用此工具。
-    它会搜索抓取目标、判断可抓取性、确认递送目标是否在附近，通过后启动后台执行。
+    机器人先看当前画面是否有该目标；找到则记录位置并返回；找不到则左转 120°
+    再看，最多扫描 3 次(约转满一圈)。一次只找一个目标——需要同时定位抓取目标和
+    递送目标时，请分两次调用本工具。
+
+    返回 JSON 字段：found(是否找到)、bbox(归一化 xyxy 位置)、height_cm(估计高度)、
+    pose(姿态)、graspable(是否可抓)、scans_used(扫描次数)。found=false 时由调用方
+    决定是否移动到别处再搜。
+
+    典型触发语句:
+        - "帮我找一下那包纸巾"
+        - "找找穿黑色上衣的人在哪"
+        - "看看附近有没有矿泉水"
     """
-    reachable, msg = await ensure_robot_reachable(ports=[CHASSIS_PORT, ARM_PORT, VIDEO_PORT])
+    reachable, msg = await ensure_robot_reachable(ports=[VIDEO_PORT, CHASSIS_PORT])
     if not reachable:
         return msg
-    agent = _get_delivery_agent()
-    if agent is None:
-        return "❌ 递送智能体不可用"
+    skill = _get_search_skill()
+    if skill is None:
+        return "❌ 搜索技能不可用"
     try:
-        # 如果显式传入了目标，同步到状态
-        state = agent.state.get()
-        if grab_target and state.grab_target != grab_target:
-            agent.state.update(grab_target=grab_target)
-        if deliver_target and state.deliver_target != deliver_target:
-            agent.state.update(deliver_target=deliver_target)
-
-        result = agent.process_confirmation(confirmed)
-        action = result.get("action")
-
-        if action == "execute":
-            return (
-                f"✅ 预检查通过，已开始执行递送任务\n"
-                f"任务ID: {result.get('task_id')}\n"
-                f"提示: {result.get('message')}"
-            )
-        elif action == "cancelled":
-            return f"⛔ 任务已取消: {result.get('message')}"
-        elif action == "precheck_need_search":
-            return f"⚠️ 预检查: {result.get('message')}"
-        elif action == "precheck_not_graspable":
-            return f"⚠️ 预检查: {result.get('message')}"
-        elif action == "precheck_destination_not_nearby":
-            return f"⚠️ 预检查: {result.get('message')}"
-        else:
-            return f"❌ 确认处理失败: {result.get('message', '未知错误')}"
+        result = skill.search_with_scan(
+            target,
+            rotate_fn=lambda: chassis_controller.left_deg(120),
+            rotate_deg=120,
+            max_scans=3,
+        )
+        return f"{'✅ 已找到' if result.get('found') else '❌ 未找到'}目标: {target}\n" + \
+            json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
-        return f"❌ 确认递送任务失败: {e}"
+        return f"❌ 搜索异常: {e}"
 
 
 @mcp.tool()
-async def delivery_status() -> str:
-    """获取当前递送任务的执行状态。"""
-    reachable, msg = await ensure_robot_reachable(ports=[CHASSIS_PORT, ARM_PORT, VIDEO_PORT])
+async def approach_target(
+    target: str = Field(description="要接近的单个目标描述，例如'一包纸巾'、'穿黑色上衣的人'"),
+    distance_cm: float = Field(default=40.0, description="期望停靠距离(厘米)，默认 40。注意：当前为基于目标框面积的反推估计，非真实深度；后续手眼外参标定后精度会提升。")
+) -> str:
+    """接近单个目标到指定距离（初步定位，为后续精细抓取/递送让出空间）。
+
+    工作方式：先在当前朝向用 VLM 定位一次拿到初始位置，然后基于底盘速度 PID
+    朝目标前进，过程中周期性重定位使目标框随接近而放大，直到估计距离达到
+    distance_cm 或超时。本工具不做抓取，只负责把机器人开到目标正前方约
+    distance_cm 处。
+
+    调用前提：目标应大致在当前画面内（通常先调用 search_target 定位/转向）。
+    若当前画面找不到目标，会直接返回失败并建议先 search_target。
+
+    返回 JSON：success(是否到位)、message、final_distance_cm(估计最终距离)。
+
+    典型编排：search_target(抓取目标) → approach_target(抓取目标) → auto_grab(抓取)
+             → search_target(递送目标) → approach_target(递送目标) → deliver
+    """
+    reachable, msg = await ensure_robot_reachable(ports=[VIDEO_PORT, CHASSIS_PORT])
     if not reachable:
         return msg
-    agent = _get_delivery_agent()
-    if agent is None:
-        return "❌ 递送智能体不可用"
+    if not _SKILLS_AVAILABLE:
+        return "❌ 接近技能不可用"
+    search = _get_search_skill()
+    approach = _get_approach_skill()
+    if search is None or approach is None:
+        return "❌ 接近技能初始化失败（视觉/底盘适配器不可用）"
     try:
-        status = agent.get_status()
-        return (
-            f"✅ 递送任务状态\n"
-            f"阶段: {status.get('phase')}\n"
-            f"抓取目标: {status.get('grab_target')}\n"
-            f"递送目标: {status.get('deliver_target')}\n"
-            f"手持物体: {status.get('held_object')}\n"
-            f"已确认: {status.get('confirmed')}\n"
-            f"预检查通过: {status.get('precheck_passed')}\n"
-            f"错误信息: {status.get('error_message')}"
+        loc = search.search(target)
+        if not loc.get("found"):
+            return (
+                f"❌ 接近失败：当前画面未找到目标「{target}」。"
+                f"建议先调用 search_target 旋转扫描定位后再接近。\n"
+                + json.dumps(loc, ensure_ascii=False)
+            )
+        bbox = loc["bbox"]
+        # 依据期望距离设置面积停止阈值（平方反比缩放），并让最终距离估算与之一致
+        approach.approach_distance_cm = distance_cm
+        approach.target_area_at_30cm = _AREA_AT_30CM * (30.0 / max(distance_cm, 1.0)) ** 2
+        result = approach.approach(
+            tuple(bbox),
+            timeout_s=30.0,
+            relocate_fn=lambda: (search.search(target) or {}).get("bbox"),
         )
+        status = "✅ 已接近" if result.get("success") else "❌ 未到位"
+        return f"{status}目标「{target}」(目标距离 {distance_cm:.0f}cm)\n" + \
+            json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
-        return f"❌ 获取递送状态失败: {e}"
+        return f"❌ 接近异常: {e}"
+
+
+@mcp.tool()
+async def deliver(
+    target: str = Field(default="", description="递送目标描述（可选，用于日志/未来手部确认），例如'穿黑色上衣的人'、'餐桌上'")
+) -> str:
+    """递送/放置：将夹爪伸到目标前方并松开夹爪，随后机械臂复位。
+
+    作为递送流程的最后一步，在已用 approach_target 接近递送目标之后调用。
+    本工具假设机器人已接近到位，只负责机械臂伸出 → 打开夹爪释放 → 复位，
+    不再移动底盘。
+
+    返回 JSON：success(是否成功)、message。
+
+    典型触发语句:
+        - "把它递过去"
+        - "放到这里"
+        - "松开夹爪把东西给他"
+    """
+    reachable, msg = await ensure_robot_reachable(ports=[ARM_PORT])
+    if not reachable:
+        return msg
+    if not _SKILLS_AVAILABLE:
+        return "❌ 递送技能不可用"
+    place = _get_place_skill()
+    if place is None:
+        return "❌ 递送技能初始化失败（机械臂适配器不可用）"
+    try:
+        result = place.execute()
+        ok = result.get("success")
+        who = f"给「{target}」" if target else ""
+        return f"{'✅ 已递送' if ok else '❌ 递送失败'}{who}\n" + \
+            json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"❌ 递送异常: {e}"
+
 
 
 if __name__ == "__main__":

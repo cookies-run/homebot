@@ -1,8 +1,9 @@
-"""HomeBot 递送任务智能体。
+"""HomeBot 递送任务技能包。
 
-该包实现一个基于大模型手册（agents/delivery_manager.md）的递送任务管理智能体，
-负责语义解析、用户确认、预检查、阶段编排和技能调用。所有实现均为新增文件，
-不修改原有的 human_follow、grab_optimized、speech_interaction 等模块。
+任务拆解（grab_target / deliver_target）已上移到调用侧 LLM（picoclaw / 语音智能体），
+本包提供 adapter 与技能原语（search / approach / grasp / place），并由
+DeliveryAgent 作为装配点持有实例。细粒度技能通过 MCP 工具单独暴露
+（skills/homebot-skill/mcp_homebot_server.py）。
 """
 
 from .agent import DeliveryAgent

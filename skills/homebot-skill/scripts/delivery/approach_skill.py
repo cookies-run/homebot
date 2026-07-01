@@ -52,13 +52,20 @@ class ApproachSkill:
     def approach(self,
                  target_bbox: Tuple[float, float, float, float],
                  timeout_s: float = 30.0,
-                 update_callback=None) -> dict:
+                 update_callback=None,
+                 relocate_fn=None,
+                 relocate_interval_s: float = 1.5) -> dict:
         """接近目标。
 
         Args:
-            target_bbox: 归一化 xyxy
+            target_bbox: 归一化 xyxy 初始位置
             timeout_s: 超时时间
             update_callback: 可选回调，接收 (tracker, frame) 用于可视化
+            relocate_fn: 可选无参回调，返回最新的归一化 bbox（None 表示本次未找到）。
+                提供时会按 relocate_interval_s 周期性重定位并更新跟踪器，使目标框
+                随机器人前进而放大，从而让面积停止阈值真正生效。不提供则退化为
+                使用初始 bbox 的开环行为（面积恒定，通常只能靠超时结束）。
+            relocate_interval_s: 两次重定位之间的最小间隔秒数
 
         Returns:
             {"success": bool, "message": str, "final_distance_cm": float}
@@ -69,6 +76,7 @@ class ApproachSkill:
 
         start = time.time()
         last_move_time = start
+        last_relocate = start
         while time.time() - start < timeout_s:
             frame_id, frame = self.vision.read_frame()
             if frame is None:
@@ -76,8 +84,20 @@ class ApproachSkill:
                 continue
 
             h, w = frame.shape[:2]
-            # 这里简化处理：直接以初始 bbox 作为目标，不做每帧 VLM
-            # 实际运行中应结合 search_skill 周期性重定位
+
+            # 周期性重定位：调用方注入 VLM/检测回调，返回最新 bbox。
+            # 只有更新了 bbox，面积才会随接近而增大，area 停止阈值才有意义。
+            now = time.time()
+            if relocate_fn is not None and now - last_relocate >= relocate_interval_s:
+                last_relocate = now
+                try:
+                    new_bbox = relocate_fn()
+                except Exception as e:
+                    logger.warning(f"接近过程中重定位异常: {e}")
+                    new_bbox = None
+                if new_bbox is not None:
+                    self.tracker.update([Detection(bbox=tuple(new_bbox), confidence=0.9)])
+
             target = self.tracker.get_primary_target()
             if target is None:
                 # 跟踪丢失，使用最后已知位置
