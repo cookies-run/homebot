@@ -14,10 +14,16 @@ _src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
+# 把当前 skills 脚本目录加入路径，确保能导入 vision_analyzer
+_scripts_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if _scripts_path not in sys.path:
+    sys.path.insert(0, _scripts_path)
+
 import cv2
 import numpy as np
 
 from common.logging import get_logger
+from vision_analyzer import VisionAnalyzer
 
 logger = get_logger(__name__)
 
@@ -29,6 +35,7 @@ class SearchSkill:
         self.vision_adapter = vision_adapter
         self.provider = provider
         self._temp_dir = tempfile.mkdtemp(prefix="delivery_search_")
+        self._analyzer = VisionAnalyzer(preferred_provider=provider)
 
     def search(self, target: str, max_retries: int = 2) -> dict:
         """搜索目标。
@@ -220,7 +227,7 @@ class SearchSkill:
         return result, extra_views, alignments
 
     def _call_vlm(self, image_path: str, target: str) -> Optional[dict]:
-        """调用 VLM 搜索目标。"""
+        """调用统一视觉分析器搜索目标。"""
         prompt = f'''你是机器人视觉定位助手。判断图片中是否存在目标物体："{target}"。
 
 匹配放宽：允许近义词/同类物体、部分遮挡、侧放或倒放、处于远处的小目标——只要能合理相信它就是该物体即可判定存在；画面中有多个时，选最可能、最完整的一个。是否存在只取决于能否看到该物体，不要因为估不出高度或姿态而判定为不存在。
@@ -238,127 +245,21 @@ class SearchSkill:
 bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, 右, 下]。scene_description 描述整张画面，不要只描述目标。'''
 
         try:
-            if self.provider == "minimax":
-                logger.info(f"[_call_vlm] 使用 MiniMax 调用 VLM，图片: {image_path}")
-                return self._call_minimax(image_path, prompt)
-            else:
-                logger.info(f"[_call_vlm] 使用 OpenAI-compatible({self.provider}) 调用 VLM，图片: {image_path}")
-                return self._call_openai_compatible(image_path, prompt)
-        except Exception as e:
-            logger.error(f"VLM 调用失败: {e}")
-            return None
-
-    def _call_minimax(self, image_path: str, prompt: str) -> Optional[dict]:
-        try:
-            import requests
-        except ImportError:
-            logger.error("未安装 requests")
-            return None
-
-        try:
-            # 优先使用 MiniMax 专属环境变量，避免 LLM 配置切换为 cctq 时密钥错误
-            api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("MINIMAX_VISION_API_KEY")
-            api_host = os.getenv("MINIMAX_API_HOST") or os.getenv("MINIMAX_VISION_API_URL")
-            if not api_key:
-                from configs.ai_config import get_ai_credentials
-                secrets = get_ai_credentials()
-                api_key = secrets.llm.api_key
-                api_host = api_host or secrets.llm.api_url
-            api_host = api_host or "https://api.minimax.chat"
-            if not api_key:
-                logger.error("MiniMax API Key 未配置")
-                return None
-
-            from urllib.parse import urlparse
-            parsed = urlparse(api_host)
-            host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme else api_host.rstrip("/v1")
-
-            with open(image_path, "rb") as f:
-                import base64
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            image_url = f"data:image/jpeg;base64,{b64}"
-
-            resp = requests.post(
-                f"{host}/v1/coding_plan/vlm",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"prompt": prompt, "image_url": image_url},
+            logger.info(f"[_call_vlm] 调用 VisionAnalyzer，provider={self.provider}，图片: {image_path}")
+            text, used_provider = self._analyzer.analyze(
+                image_paths=image_path,
+                prompt=prompt,
+                max_tokens=1024,
                 timeout=30,
             )
-            logger.info(f"[_call_minimax] HTTP status={resp.status_code}, url={host}/v1/coding_plan/vlm")
-            resp.raise_for_status()
-            data = resp.json()
-            logger.info(f"[_call_minimax] 响应体: {data}")
-
-            # MiniMax 标准错误封装
-            base_resp = data.get("base_resp") or {}
-            status_code = base_resp.get("status_code") or base_resp.get("code") or 0
-            if status_code != 0:
-                logger.error(
-                    f"[_call_minimax] MiniMax 接口返回错误: "
-                    f"status_code={base_resp.get('status_code')}, code={base_resp.get('code')}, "
-                    f"status_msg={base_resp.get('status_msg', '')}"
-                )
-
-            # 兼容多种返回结构：原生 /v1/coding_plan/vlm 的 data.content / data.text，
-            # 以及 OpenAI-compatible 格式的 data.choices[0].message.content
-            text = ""
-            if isinstance(data, dict):
-                if "content" in data and data["content"]:
-                    text = data["content"]
-                elif "text" in data and data["text"]:
-                    text = data["text"]
-                elif "choices" in data and isinstance(data["choices"], list):
-                    choice = data["choices"][0]
-                    if isinstance(choice, dict):
-                        message = choice.get("message", {})
-                        text = message.get("content", "") if isinstance(message, dict) else ""
-
-            if not text:
-                logger.warning(f"[_call_minimax] 模型返回内容为空，请检查响应体结构: {data}")
-
-            logger.info(f"[_call_minimax] 提取到的模型原始返回: {text}")
+            logger.info(f"[_call_vlm] provider={used_provider} 模型原始返回: {text}")
             parsed = self._parse_json(text)
-            logger.info(f"[_call_minimax] 解析后结果: {parsed}")
+            logger.info(f"[_call_vlm] 解析后结果: {parsed}")
             if parsed and "scene_description" not in parsed:
                 parsed["scene_description"] = "（模型未返回画面描述）"
             return parsed
         except Exception as e:
-            logger.error(f"MiniMax VLM 失败: {e}")
-            return None
-
-    def _call_openai_compatible(self, image_path: str, prompt: str) -> Optional[dict]:
-        try:
-            from configs.config import get_config
-            from services.llm_service.llm_client import get_llm_client
-
-            client = get_llm_client()
-            cfg = get_config().llm
-
-            import base64
-            with open(image_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-
-            response = client.chat_completion(
-                model=cfg.model,
-                messages=[
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                    ]}
-                ],
-                temperature=0.1,
-                max_tokens=1024,
-                top_p=0.9,
-            )
-            text = response["choices"][0]["message"]["content"] or ""
-            logger.info(f"[_call_openai_compatible] 模型原始返回: {text}")
-            parsed = self._parse_json(text)
-            logger.info(f"[_call_openai_compatible] 解析后结果: {parsed}")
-            if parsed and "scene_description" not in parsed:
-                parsed["scene_description"] = "（模型未返回画面描述）"
-            return parsed
-        except Exception as e:
-            logger.error(f"OpenAI-compatible VLM 失败: {e}")
+            logger.error(f"VLM 调用失败: {e}")
             return None
 
     def _parse_json(self, text: str) -> Optional[dict]:

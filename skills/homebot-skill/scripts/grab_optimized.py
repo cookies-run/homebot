@@ -40,6 +40,11 @@ import shutil
 from enum import Enum, auto
 from datetime import datetime
 
+# 提前把 software/src 加入路径，供 common/configs/vision_analyzer 使用
+_src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../software/src'))
+if _src_path not in sys.path:
+    sys.path.insert(0, _src_path)
+
 import numpy as np
 
 _CV2_AVAILABLE = False
@@ -63,44 +68,17 @@ try:
 except ImportError as e:
     print(f"[GRAB] [WARN] camera_geometry 不可用: {e}")
 
-# 视觉分析客户端注册（按全局 VISION_PROVIDER 决定首选，而非硬编码顺序）
-_AVAILABLE_VLM_MAP = {}
+# 统一视觉分析器（按全局 VISION_PROVIDER 路由，业务代码不再直接调底层客户端）
 try:
-    from cctq_vision_client import analyze_images as _cctq_analyze
-    _AVAILABLE_VLM_MAP["cctq"] = _cctq_analyze
-except ImportError:
-    pass
-try:
-    from minimax_vision_client import analyze_images_m3 as _minimax_analyze
-    _AVAILABLE_VLM_MAP["minimax"] = _minimax_analyze
-except ImportError:
-    pass
-try:
-    from volcengine_vision_client import analyze_images as _volcengine_analyze
-    _AVAILABLE_VLM_MAP["volcengine"] = _volcengine_analyze
-except ImportError:
-    pass
-
-
-def _get_vlm_provider_order() -> list:
-    """根据全局配置决定 VLM 调用顺序，未配置时默认 minimax -> cctq -> volcengine。"""
-    try:
-        from configs.ai_config import get_ai_credentials
-        preferred = get_ai_credentials().vision.provider
-    except Exception:
-        preferred = ""
-    if preferred and preferred in _AVAILABLE_VLM_MAP:
-        others = [n for n in _AVAILABLE_VLM_MAP if n != preferred]
-        return [preferred] + others
-    # 默认顺序：minimax 优先
-    default_order = ["minimax", "cctq", "volcengine"]
-    return [n for n in default_order if n in _AVAILABLE_VLM_MAP]
-
-
-_VLM_PROVIDER_ORDER = _get_vlm_provider_order()
-VLM_PROVIDER = _VLM_PROVIDER_ORDER[0] if _VLM_PROVIDER_ORDER else None
-if not _VLM_PROVIDER_ORDER:
-    print("[WARN] 未找到视觉分析客户端，抓取功能将不可用")
+    from vision_analyzer import VisionAnalyzer
+    _VISION_ANALYZER = VisionAnalyzer()
+    VLM_PROVIDER = _VISION_ANALYZER.get_order()[0] if _VISION_ANALYZER.get_order() else None
+    if not VLM_PROVIDER:
+        print("[WARN] 未找到视觉分析客户端，抓取功能将不可用")
+except Exception as e:
+    print(f"[WARN] 初始化 VisionAnalyzer 失败: {e}")
+    _VISION_ANALYZER = None
+    VLM_PROVIDER = None
 
 
 def analyze_images_with_fallback(
@@ -111,52 +89,25 @@ def analyze_images_with_fallback(
     timeout: int = 60,
 ) -> tuple[str, str]:
     """
-    按全局 VISION_PROVIDER 配置优先调用 VLM，失败时依次回退到其他可用 provider。
+    统一视觉分析器封装，按全局 VISION_PROVIDER 配置调用，失败时回退。
+    保留此函数签名以兼容现有调用方。
 
     Returns:
         (text_result, provider_name)
     """
-    if not _VLM_PROVIDER_ORDER:
+    if _VISION_ANALYZER is None:
         raise RuntimeError("没有可用的视觉分析客户端")
-
-    last_err = None
-    for name in _VLM_PROVIDER_ORDER:
-        fn = _AVAILABLE_VLM_MAP[name]
-        try:
-            print(f"[GRAB] 尝试 VLM provider: {name}")
-            if name == "volcengine":
-                result = fn(
-                    image_paths=image_paths,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    reasoning_effort=reasoning_effort,
-                )
-            elif name == "cctq":
-                result = fn(
-                    image_paths=image_paths,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    timeout=timeout,
-                )
-            else:
-                result = fn(
-                    image_paths=image_paths,
-                    prompt=prompt,
-                    timeout=timeout,
-                    max_tokens=max_tokens,
-                )
-            print(f"[GRAB] VLM({name}) 调用成功")
-            return result, name
-        except Exception as e:
-            print(f"[GRAB] VLM({name}) 调用失败: {e}，尝试下一个 provider")
-            last_err = e
-            continue
-    raise last_err or RuntimeError("所有 VLM provider 均失败")
+    return _VISION_ANALYZER.analyze(
+        image_paths=image_paths,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        reasoning_effort=reasoning_effort,
+    )
 
 import robot_config as config
 
-# 引入机械臂配置和运动学
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../software/src'))
+# 引入机械臂配置和运动学（software/src 已在文件顶部加入路径）
 from configs.config import get_config as _get_arm_config
 _ARM_CFG = _get_arm_config().arm
 _JOINT_LIMITS = _ARM_CFG.joint_limits
