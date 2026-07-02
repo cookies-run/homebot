@@ -94,7 +94,7 @@ class LLMCredentials:
 @dataclass
 class VisionCredentials:
     """图片理解/Vision 服务配置"""
-    provider: str = "deepseek"  # deepseek/qwen/openai
+    provider: str = "minimax"  # minimax/deepseek/qwen/openai
     api_key: str = ""
     api_url: str = ""
     model: str = ""
@@ -169,19 +169,23 @@ def load_ai_credentials() -> AICredentials:
     )
     
     # Vision 配置
-    vision_provider = _get_env("VISION_PROVIDER", "deepseek")
-    
+    vision_provider = _get_env("VISION_PROVIDER", "minimax")
+
     # 根据provider获取对应的配置
     vision_api_key = _get_env("VISION_API_KEY", "")
     vision_api_url = _get_env("VISION_API_URL", "")
     vision_model = _get_env("VISION_MODEL", "")
-    
-    # 如果没有单独设置VISION配置，使用LLM的配置
+
+    # 如果没有单独设置VISION配置，按 provider 复用对应密钥
     if not vision_api_key and vision_provider == "deepseek":
         vision_api_key = llm.api_key
-        vision_api_url = llm.api_url or "https://api.deepseek.com/v1"
+        vision_api_url = vision_api_url or llm.api_url or "https://api.deepseek.com/v1"
         vision_model = vision_model or "deepseek-chat"
-    
+    elif not vision_api_key and vision_provider == "minimax":
+        vision_api_key = _get_env("MINIMAX_API_KEY", "")
+        vision_api_url = vision_api_url or _get_env("MINIMAX_API_HOST", "") or "https://api.minimax.chat"
+        vision_model = vision_model or "MiniMax-M1-Vision"
+
     vision = VisionCredentials(
         provider=vision_provider,
         api_key=vision_api_key,
