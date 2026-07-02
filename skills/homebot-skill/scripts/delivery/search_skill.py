@@ -47,23 +47,31 @@ class SearchSkill:
 
         last_reason = "多次尝试未在画面中找到目标"
         for attempt in range(max_retries + 1):
+            logger.info(f"[search] 第 {attempt + 1}/{max_retries + 1} 次尝试读取机身摄像头画面")
             frame_id, frame = self.vision_adapter.read_frame()
             if frame is None:
                 last_reason = "未读取到摄像头画面（机身摄像头无帧）"
+                logger.warning(f"[search] 未读取到画面，frame_id={frame_id}")
                 time.sleep(0.2)
                 continue
 
             path = os.path.join(self._temp_dir, f"search_{int(time.time()*1000)}.jpg")
             cv2.imwrite(path, frame)
+            logger.info(f"[search] 已保存待分析图片: {path}")
 
             result = self._call_vlm(path, target)
             if result is None:
                 last_reason = "VLM 无响应或返回无法解析（可能被截断/非 JSON）"
+                logger.warning(f"[search] VLM 返回 None，继续尝试")
                 continue
+            logger.info(f"[search] VLM 返回结果: {result}")
             if result.get("found"):
+                logger.info(f"[search] ✅ 找到目标: {target}")
                 return result
             last_reason = result.get("reason") or "模型判定画面中无该目标"
+            logger.info(f"[search] ❌ 未找到目标，模型 reason: {last_reason}")
 
+        logger.warning(f"[search] 全部 {max_retries + 1} 次尝试失败，最终 reason: {last_reason}")
         return {"found": False, "reason": last_reason}
 
     def search_with_scan(self, target: str, rotate_fn, rotate_deg: float = 120.0,
@@ -93,18 +101,24 @@ class SearchSkill:
         """
         views_used = 0
         rotations_used = 0
+        logger.info(f"[search_with_scan] 开始旋转扫描目标: {target}, rotate_deg={rotate_deg}, max_rotations={max_rotations}")
         while True:
             # 每个朝向只取一帧分析一次；转一圈已覆盖各角度，无需在原地重复截帧
+            logger.info(f"[search_with_scan] 当前朝向 #{views_used + 1}（已旋转 {rotations_used} 次）")
             result = self.search(target, max_retries=0)
             views_used += 1
+            logger.info(f"[search_with_scan] 第 {views_used} 帧结果: found={result.get('found')}")
             if result.get("found"):
                 result["graspable"] = self.check_graspable(result).get("graspable", False)
                 result["views_used"] = views_used
                 result["rotations_used"] = rotations_used
+                logger.info(f"[search_with_scan] ✅ 扫描中找到目标，最终返回: {result}")
                 return result
             if rotations_used >= max_rotations:
+                logger.info(f"[search_with_scan] 已旋转 {rotations_used} 次，达到上限，结束扫描")
                 break
             try:
+                logger.info(f"[search_with_scan] 未找到，执行第 {rotations_used + 1} 次旋转")
                 rotate_fn()
             except Exception as e:
                 logger.error(f"旋转失败，中止扫描: {e}")
@@ -115,15 +129,18 @@ class SearchSkill:
                     "reason": f"旋转失败: {e}",
                 }
             rotations_used += 1
+            logger.info(f"[search_with_scan] 旋转完成，等待 {settle_s}s 画面稳定")
             time.sleep(settle_s)
 
-        return {
+        final = {
             "found": False,
             "views_used": views_used,
             "rotations_used": rotations_used,
             "reason": f"旋转扫描一圈（旋转 {rotations_used} 次，约 {rotate_deg * rotations_used:.0f}°）"
                       f"未在 {views_used} 帧画面中找到目标",
         }
+        logger.info(f"[search_with_scan] 扫描结束，最终返回: {final}")
+        return final
 
     def _call_vlm(self, image_path: str, target: str) -> Optional[dict]:
         """调用 VLM 搜索目标。"""
@@ -144,8 +161,10 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
 
         try:
             if self.provider == "minimax":
+                logger.info(f"[_call_vlm] 使用 MiniMax 调用 VLM，图片: {image_path}")
                 return self._call_minimax(image_path, prompt)
             else:
+                logger.info(f"[_call_vlm] 使用 OpenAI-compatible({self.provider}) 调用 VLM，图片: {image_path}")
                 return self._call_openai_compatible(image_path, prompt)
         except Exception as e:
             logger.error(f"VLM 调用失败: {e}")
@@ -187,10 +206,14 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
                 json={"prompt": prompt, "image_url": image_url},
                 timeout=30,
             )
+            logger.info(f"[_call_minimax] HTTP status={resp.status_code}, url={host}/v1/coding_plan/vlm")
             resp.raise_for_status()
             data = resp.json()
             text = data.get("text", "")
-            return self._parse_json(text)
+            logger.info(f"[_call_minimax] 模型原始返回: {text}")
+            parsed = self._parse_json(text)
+            logger.info(f"[_call_minimax] 解析后结果: {parsed}")
+            return parsed
         except Exception as e:
             logger.error(f"MiniMax VLM 失败: {e}")
             return None
@@ -220,7 +243,10 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
                 top_p=0.9,
             )
             text = response["choices"][0]["message"]["content"] or ""
-            return self._parse_json(text)
+            logger.info(f"[_call_openai_compatible] 模型原始返回: {text}")
+            parsed = self._parse_json(text)
+            logger.info(f"[_call_openai_compatible] 解析后结果: {parsed}")
+            return parsed
         except Exception as e:
             logger.error(f"OpenAI-compatible VLM 失败: {e}")
             return None
