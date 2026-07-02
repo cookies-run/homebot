@@ -201,8 +201,8 @@ python scripts/arm_control.py status             # 查询各关节角度
 
 `search_target(target)` — 旋转扫描定位**单个**目标。
 
-- 先看当前画面；找不到则左转 120° 再看，最多 3 次（约转满一圈）。
-- 返回 JSON：`found`、`bbox`(归一化 xyxy)、`height_cm`、`pose`、`graspable`、`scans_used`。
+- 先看当前画面；找不到则左转 120° 再看，最多旋转 3 次（转满一圈回到起始朝向，最多分析 4 帧）。
+- 返回 JSON：`found`、`bbox`(归一化 xyxy)、`height_cm`、`pose`、`graspable`、`views_used`、`rotations_used`。
 - `found=false` 时由 openclaw 决定是否移动到别处再搜。
 - 底层：`scripts/delivery/search_skill.py`（VLM 视觉搜索）。
 

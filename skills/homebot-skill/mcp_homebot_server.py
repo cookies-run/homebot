@@ -356,12 +356,12 @@ async def search_target(
     """旋转扫描寻找单个目标，返回其在画面中的位置(bbox)。
 
     机器人先看当前画面是否有该目标；找到则记录位置并返回；找不到则左转 120°
-    再看，最多扫描 3 次(约转满一圈)。一次只找一个目标——需要同时定位抓取目标和
-    递送目标时，请分两次调用本工具。
+    再看，如此循环最多旋转 3 次(转满一圈回到起始朝向，最多分析 4 帧)。一次只找
+    一个目标——需要同时定位抓取目标和递送目标时，请分两次调用本工具。
 
     返回 JSON 字段：found(是否找到)、bbox(归一化 xyxy 位置)、height_cm(估计高度)、
-    pose(姿态)、graspable(是否可抓)、scans_used(扫描次数)。found=false 时由调用方
-    决定是否移动到别处再搜。
+    pose(姿态)、graspable(是否可抓)、views_used(实际搜索画面数)、rotations_used(实际
+    成功旋转次数)。found=false 时由调用方决定是否移动到别处再搜。
 
     典型触发语句:
         - "帮我找一下那包纸巾"
@@ -379,7 +379,7 @@ async def search_target(
             target,
             rotate_fn=lambda: chassis_controller.left_deg(120),
             rotate_deg=120,
-            max_scans=3,
+            max_rotations=3,
         )
         return f"{'✅ 已找到' if result.get('found') else '❌ 未找到'}目标: {target}\n" + \
             json.dumps(result, ensure_ascii=False, indent=2)
