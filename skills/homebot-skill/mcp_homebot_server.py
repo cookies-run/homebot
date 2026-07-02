@@ -361,8 +361,9 @@ async def search_target(
 
     返回 JSON 字段：found(是否找到)、bbox(归一化 xyxy 位置)、height_cm(估计高度)、
     pose(姿态)、scene_description(模型对整张画面的描述)、graspable(是否可抓)、
-    views_used(实际搜索画面数)、rotations_used(实际成功旋转次数)。found=false 时由调用方
-    决定是否移动到别处再搜。
+    views_used(实际搜索画面数)、rotations_used(扫描旋转次数)、alignments_used(找到目标后
+    微调对准次数)。找到目标后会尽量让机身正面正对目标。found=false 时由调用方决定是否移动
+    到别处再搜。
 
     典型触发语句:
         - "帮我找一下那包纸巾"
@@ -381,6 +382,10 @@ async def search_target(
             rotate_fn=lambda: chassis_controller.left_deg(120),
             rotate_deg=120,
             max_rotations=3,
+            align_fn=lambda deg: chassis_controller.left_deg(deg) if deg > 0 else chassis_controller.right_deg(-deg),
+            camera_hfov_deg=60.0,
+            align_threshold=0.1,
+            max_align_attempts=3,
         )
         return f"{'✅ 已找到' if result.get('found') else '❌ 未找到'}目标: {target}\n" + \
             json.dumps(result, ensure_ascii=False, indent=2)

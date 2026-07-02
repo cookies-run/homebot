@@ -78,33 +78,44 @@ class SearchSkill:
         return {"found": False, "reason": last_reason}
 
     def search_with_scan(self, target: str, rotate_fn, rotate_deg: float = 120.0,
-                         max_rotations: int = 3, settle_s: float = 0.6) -> dict:
-        """原地旋转扫描搜索单个目标。
+                         max_rotations: int = 3, settle_s: float = 0.6,
+                         align_fn=None, camera_hfov_deg: float = 60.0,
+                         align_threshold: float = 0.1,
+                         max_align_attempts: int = 3) -> dict:
+        """原地旋转扫描搜索单个目标，找到后尽量让机身正面正对目标。
 
         先看当前朝向；找不到则调用 rotate_fn 旋转 rotate_deg 后再看，如此循环，
         最多旋转 max_rotations 次（默认 3 次 * 120° = 转满一圈回到起始朝向）。
-        因此最多分析 max_rotations + 1 帧画面。旋转由外部注入以解耦底盘实现。
+        找到目标后，如果提供了 align_fn，会根据目标 bbox 中心与画面中心的偏差
+        计算角度并微调机身朝向，使机身正面正对目标。
 
         Args:
             target: 目标描述
-            rotate_fn: 无参回调，执行一次底盘旋转（角度由调用方绑定）
-            rotate_deg: 单次旋转角度，仅用于结果记录
-            max_rotations: 最大旋转次数（转满一圈所需的次数）
+            rotate_fn: 无参回调，执行一次底盘旋转（角度由调用方绑定，用于大角度扫描）
+            rotate_deg: 单次扫描旋转角度，仅用于结果记录
+            max_rotations: 最大扫描次数（转满一圈所需的次数）
             settle_s: 旋转后等待画面稳定的秒数
+            align_fn: 可选，单参数回调 align_fn(deg: float)，正数左转、负数右转，
+                      用于找到目标后的精对准；不提供则只返回找到结果
+            camera_hfov_deg: 机身摄像头水平视场角，用于把像素偏差换算成旋转角度
+            align_threshold: 目标中心与画面中心偏差阈值（0~1 归一化），低于此值认为已对准
+            max_align_attempts: 最大对准尝试次数
 
         Returns:
             {
                 "found": bool,
                 "views_used": int,       # 实际分析的画面数
                 "rotations_used": int,   # 实际成功旋转的次数
+                "alignments_used": int,  # 实际执行的精对准旋转次数
                 "bbox": [...], "height_cm": float, "pose": str,
-                "scene_description": str,  # 对整张画面内容的简短描述
+                "scene_description": str,
                 "graspable": bool,
                 "reason": str
             }
         """
         views_used = 0
         rotations_used = 0
+        alignments_used = 0
         logger.info(f"[search_with_scan] 开始旋转扫描目标: {target}, rotate_deg={rotate_deg}, max_rotations={max_rotations}")
         while True:
             # 每个朝向只取一帧分析一次；转一圈已覆盖各角度，无需在原地重复截帧
@@ -116,6 +127,17 @@ class SearchSkill:
                 result["graspable"] = self.check_graspable(result).get("graspable", False)
                 result["views_used"] = views_used
                 result["rotations_used"] = rotations_used
+                # 精对准：让机身正面正对目标
+                if align_fn is not None:
+                    result, aligned_views, aligned_times = self._align_to_target(
+                        target, result, align_fn, camera_hfov_deg,
+                        align_threshold, max_align_attempts, settle_s
+                    )
+                    views_used += aligned_views
+                    alignments_used += aligned_times
+                result["views_used"] = views_used
+                result["rotations_used"] = rotations_used
+                result["alignments_used"] = alignments_used
                 logger.info(f"[search_with_scan] ✅ 扫描中找到目标，最终返回: {result}")
                 return result
             if rotations_used >= max_rotations:
@@ -130,6 +152,7 @@ class SearchSkill:
                     "found": False,
                     "views_used": views_used,
                     "rotations_used": rotations_used,
+                    "alignments_used": alignments_used,
                     "reason": f"旋转失败: {e}",
                 }
             rotations_used += 1
@@ -140,11 +163,58 @@ class SearchSkill:
             "found": False,
             "views_used": views_used,
             "rotations_used": rotations_used,
+            "alignments_used": alignments_used,
             "reason": f"旋转扫描一圈（旋转 {rotations_used} 次，约 {rotate_deg * rotations_used:.0f}°）"
                       f"未在 {views_used} 帧画面中找到目标",
         }
         logger.info(f"[search_with_scan] 扫描结束，最终返回: {final}")
         return final
+
+    def _align_to_target(self, target: str, current_result: dict, align_fn,
+                         camera_hfov_deg: float, align_threshold: float,
+                         max_align_attempts: int, settle_s: float) -> tuple:
+        """找到目标后微调机身朝向，使目标位于画面中央。
+
+        Returns:
+            (final_result, extra_views_used, alignment_rotations_used)
+        """
+        extra_views = 0
+        alignments = 0
+        result = current_result
+        for attempt in range(max_align_attempts):
+            bbox = result.get("bbox")
+            if not bbox or len(bbox) != 4:
+                logger.warning(f"[_align_to_target] 缺少 bbox，停止对准")
+                break
+            center_x = (bbox[0] + bbox[2]) / 2.0
+            offset = center_x - 0.5
+            logger.info(f"[_align_to_target] 第 {attempt + 1} 次对准，目标中心 x={center_x:.3f}, 偏差={offset:+.3f}")
+            if abs(offset) <= align_threshold:
+                logger.info(f"[_align_to_target] 偏差在阈值 {align_threshold} 内，对准完成")
+                break
+            # 偏差 > 0 说明目标偏右，机身需右转（负角度）；偏差 < 0 说明偏左，机身左转（正角度）
+            angle_deg = -offset * camera_hfov_deg
+            # 限制最小/最大步长，避免抖动或过度旋转
+            min_step = 5.0
+            if 0 < abs(angle_deg) < min_step:
+                angle_deg = min_step if angle_deg > 0 else -min_step
+            logger.info(f"[_align_to_target] 执行对准旋转 angle={angle_deg:+.1f}°")
+            try:
+                align_fn(angle_deg)
+            except Exception as e:
+                logger.error(f"[_align_to_target] 对准旋转失败: {e}")
+                break
+            alignments += 1
+            time.sleep(settle_s)
+            result = self.search(target, max_retries=0)
+            extra_views += 1
+            logger.info(f"[_align_to_target] 对准后第 {extra_views} 帧结果: {result}")
+            if not result.get("found"):
+                logger.warning(f"[_align_to_target] 对准后丢失目标，保留上次结果")
+                result = current_result
+                break
+            current_result = result
+        return result, extra_views, alignments
 
     def _call_vlm(self, image_path: str, target: str) -> Optional[dict]:
         """调用 VLM 搜索目标。"""

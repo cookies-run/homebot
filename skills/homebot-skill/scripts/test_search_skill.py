@@ -9,7 +9,8 @@
 
 参数：
     --target      要搜索的目标描述（默认：一包纸巾）
-    --scan        是否执行旋转扫描（需要底盘可用，默认只拍一帧）
+    --scan        是否执行旋转扫描（需要底盘可用）
+    --align       找到目标后是否精对准机身正面（需要底盘可用，可与 --scan 同时用）
     --provider    VLM provider，默认 minimax
     --ip          机器人 IP，默认 localhost
     --port        机身摄像头视频端口，默认 5560
@@ -39,6 +40,7 @@ def main():
     parser = argparse.ArgumentParser(description="测试 SearchSkill 寻物能力")
     parser.add_argument("--target", default="一包纸巾", help="要搜索的目标描述")
     parser.add_argument("--scan", action="store_true", help="是否执行旋转扫描（需要底盘）")
+    parser.add_argument("--align", action="store_true", help="扫描找到目标后是否精对准（需要底盘）")
     parser.add_argument("--provider", default="minimax", help="VLM provider")
     parser.add_argument("--ip", default="localhost", help="机器人 IP")
     parser.add_argument("--port", type=int, default=5560, help="机身摄像头视频端口")
@@ -51,21 +53,27 @@ def main():
 
     skill = SearchSkill(vision_adapter=vision_adapter, provider=args.provider)
 
-    if args.scan:
-        print("[TEST] 执行旋转扫描寻物", file=sys.stderr)
+    kwargs = {}
+    if args.scan or args.align:
         try:
             from chassis_control import HomeBotChassisController
             from robot_config import CHASSIS_PORT
             chassis = HomeBotChassisController(f"tcp://{args.ip}:{CHASSIS_PORT}")
-            result = skill.search_with_scan(
-                args.target,
-                rotate_fn=lambda: chassis.left_deg(120),
-                rotate_deg=120,
-                max_rotations=3,
-            )
+            if args.scan:
+                kwargs["rotate_fn"] = lambda: chassis.left_deg(120)
+                kwargs["rotate_deg"] = 120
+                kwargs["max_rotations"] = 3
+            if args.align:
+                kwargs["align_fn"] = lambda deg: chassis.left_deg(deg) if deg > 0 else chassis.right_deg(-deg)
+                kwargs["camera_hfov_deg"] = 60.0
+                kwargs["align_threshold"] = 0.1
+                kwargs["max_align_attempts"] = 3
         except Exception as e:
-            print(f"[TEST] 旋转扫描失败: {e}，回退到单帧搜索", file=sys.stderr)
-            result = skill.search(args.target, max_retries=0)
+            print(f"[TEST] 底盘初始化失败: {e}", file=sys.stderr)
+
+    if "rotate_fn" in kwargs:
+        print("[TEST] 执行旋转扫描寻物", file=sys.stderr)
+        result = skill.search_with_scan(args.target, **kwargs)
     else:
         print("[TEST] 执行单帧寻物", file=sys.stderr)
         result = skill.search(args.target, max_retries=0)
