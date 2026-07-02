@@ -70,12 +70,29 @@ def _get_api_key_and_host(api_key: Optional[str], api_host: Optional[str]) -> tu
     return api_key, api_host
 
 
+def _extract_minimax_text(data: Any) -> str:
+    """从 MiniMax 响应中提取文本内容，兼容 content / text / choices 三种结构。"""
+    if not isinstance(data, dict):
+        return ""
+    if "content" in data and data["content"]:
+        return data["content"]
+    if "text" in data and data["text"]:
+        return data["text"]
+    choices = data.get("choices", [])
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+        if isinstance(message, dict):
+            return message.get("content", "") or ""
+    return ""
+
+
 def analyze_images(
     image_paths: List[str],
     prompt: str = "请描述这张图片的内容",
     api_key: Optional[str] = None,
     api_host: Optional[str] = None,
     timeout: int = 60,
+    max_tokens: Optional[int] = None,
 ) -> str:
     """
     调用 MiniMax /v1/coding_plan/vlm 端点分析图片内容
@@ -86,6 +103,7 @@ def analyze_images(
         api_key: API 密钥，默认从 MINIMAX_API_KEY 环境变量读取
         api_host: API 地址，默认从 MINIMAX_API_HOST 环境变量读取
         timeout: 请求超时秒数
+        max_tokens: 最大输出 token 数（可选）
 
     Returns:
         VLM 返回的文本内容
@@ -106,6 +124,8 @@ def analyze_images(
         "prompt": prompt,
         "image_url": image_url,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -120,7 +140,7 @@ def analyze_images(
         status_msg = base_resp.get("status_msg", "unknown error")
         raise RuntimeError(f"MiniMax API 错误 [{status_code}]: {status_msg}")
 
-    return data.get("content", "")
+    return _extract_minimax_text(data)
 
 
 def analyze_images_m3(
@@ -130,6 +150,7 @@ def analyze_images_m3(
     api_host: Optional[str] = None,
     timeout: int = 60,
     model: str = "MiniMax-M2.7",
+    max_tokens: Optional[int] = None,
 ) -> str:
     """
     调用 MiniMax 多模态模型分析图片。
@@ -156,6 +177,7 @@ def analyze_images_m3(
             api_key=api_key,
             api_host=api_host,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
 
     api_key, api_host = _get_api_key_and_host(api_key, api_host)
@@ -184,6 +206,8 @@ def analyze_images_m3(
             }
         ],
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
@@ -195,12 +219,7 @@ def analyze_images_m3(
     if data.get("error"):
         raise RuntimeError(f"MiniMax Chat Completions API 错误: {data['error']}")
 
-    choices = data.get("choices", [])
-    if not choices:
-        raise RuntimeError("MiniMax Chat Completions API 返回为空 choices")
-
-    message = choices[0].get("message", {})
-    return message.get("content", "")
+    return _extract_minimax_text(data)
 
 
 def main():

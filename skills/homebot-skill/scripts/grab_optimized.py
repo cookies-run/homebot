@@ -63,26 +63,43 @@ try:
 except ImportError as e:
     print(f"[GRAB] [WARN] camera_geometry 不可用: {e}")
 
-# 视觉分析客户端优先级：cctq(gpt-5.5) -> MiniMax -> 火山引擎
-_AVAILABLE_VLM = []
+# 视觉分析客户端注册（按全局 VISION_PROVIDER 决定首选，而非硬编码顺序）
+_AVAILABLE_VLM_MAP = {}
 try:
     from cctq_vision_client import analyze_images as _cctq_analyze
-    _AVAILABLE_VLM.append(("cctq", _cctq_analyze))
+    _AVAILABLE_VLM_MAP["cctq"] = _cctq_analyze
 except ImportError:
     pass
 try:
     from minimax_vision_client import analyze_images_m3 as _minimax_analyze
-    _AVAILABLE_VLM.append(("minimax", _minimax_analyze))
+    _AVAILABLE_VLM_MAP["minimax"] = _minimax_analyze
 except ImportError:
     pass
 try:
     from volcengine_vision_client import analyze_images as _volcengine_analyze
-    _AVAILABLE_VLM.append(("volcengine", _volcengine_analyze))
+    _AVAILABLE_VLM_MAP["volcengine"] = _volcengine_analyze
 except ImportError:
     pass
 
-VLM_PROVIDER = _AVAILABLE_VLM[0][0] if _AVAILABLE_VLM else None
-if not _AVAILABLE_VLM:
+
+def _get_vlm_provider_order() -> list:
+    """根据全局配置决定 VLM 调用顺序，未配置时默认 minimax -> cctq -> volcengine。"""
+    try:
+        from configs.ai_config import get_ai_credentials
+        preferred = get_ai_credentials().vision.provider
+    except Exception:
+        preferred = ""
+    if preferred and preferred in _AVAILABLE_VLM_MAP:
+        others = [n for n in _AVAILABLE_VLM_MAP if n != preferred]
+        return [preferred] + others
+    # 默认顺序：minimax 优先
+    default_order = ["minimax", "cctq", "volcengine"]
+    return [n for n in default_order if n in _AVAILABLE_VLM_MAP]
+
+
+_VLM_PROVIDER_ORDER = _get_vlm_provider_order()
+VLM_PROVIDER = _VLM_PROVIDER_ORDER[0] if _VLM_PROVIDER_ORDER else None
+if not _VLM_PROVIDER_ORDER:
     print("[WARN] 未找到视觉分析客户端，抓取功能将不可用")
 
 
@@ -94,16 +111,17 @@ def analyze_images_with_fallback(
     timeout: int = 60,
 ) -> tuple[str, str]:
     """
-    按优先级调用 VLM：首选 cctq(gpt-5.5)，失败时依次回退到 MiniMax / 火山引擎。
+    按全局 VISION_PROVIDER 配置优先调用 VLM，失败时依次回退到其他可用 provider。
 
     Returns:
         (text_result, provider_name)
     """
-    if not _AVAILABLE_VLM:
+    if not _VLM_PROVIDER_ORDER:
         raise RuntimeError("没有可用的视觉分析客户端")
 
     last_err = None
-    for name, fn in _AVAILABLE_VLM:
+    for name in _VLM_PROVIDER_ORDER:
+        fn = _AVAILABLE_VLM_MAP[name]
         try:
             print(f"[GRAB] 尝试 VLM provider: {name}")
             if name == "volcengine":
@@ -113,11 +131,19 @@ def analyze_images_with_fallback(
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
                 )
+            elif name == "cctq":
+                result = fn(
+                    image_paths=image_paths,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
             else:
                 result = fn(
                     image_paths=image_paths,
                     prompt=prompt,
                     timeout=timeout,
+                    max_tokens=max_tokens,
                 )
             print(f"[GRAB] VLM({name}) 调用成功")
             return result, name
@@ -1011,7 +1037,7 @@ class AutoGrabWorkflow:
 
 只输出 JSON，不要 Markdown 代码块、解释或任何额外文字。'''
         return self._vlm_call(image_path, prompt, ["bbox", "is_cylinder", "pose"],
-                              max_tokens=320, timeout=60)
+                              max_tokens=1024, timeout=60)
 
     def _vlm_locate_target(self, image_path: str, target_object: str) -> dict | None:
         """Phase 2 第 2 次 VLM：末端摄像头目标定位，返回 JSON {bbox, grasp_center}"""
@@ -1040,7 +1066,7 @@ class AutoGrabWorkflow:
 
 注意：坐标请使用 [0, 1000] 的整数范围。'''
         return self._vlm_call(image_path, prompt, ["bbox"],
-                              max_tokens=192, timeout=60)
+                              max_tokens=1024, timeout=60)
 
     def _phase1_detect_and_align(self, target_object: str) -> dict:
         """Phase 1: 属性测姿 + Tracker 驱动底盘 coarse alignment"""
@@ -1695,7 +1721,7 @@ class AutoGrabWorkflow:
 }}'''
 
         result = self._vlm_call(img_path, prompt, ["aligned", "reason"],
-                                max_tokens=128, timeout=60)
+                                max_tokens=512, timeout=60)
         if result is None:
             return {"success": False, "message": "Phase 4 VLM 终审失败"}
 
