@@ -71,11 +71,18 @@ def main():
         except Exception as e:
             print(f"[TEST] 底盘初始化失败: {e}", file=sys.stderr)
 
+    mode = []
     if "rotate_fn" in kwargs:
-        print("[TEST] 执行旋转扫描寻物", file=sys.stderr)
+        mode.append("旋转扫描")
+    if "align_fn" in kwargs:
+        mode.append("精对准")
+    if not mode:
+        mode.append("单帧")
+    print(f"[TEST] 执行{'+'.join(mode)}寻物", file=sys.stderr)
+
+    if "rotate_fn" in kwargs:
         result = skill.search_with_scan(args.target, **kwargs)
     else:
-        print("[TEST] 执行单帧寻物", file=sys.stderr)
         result = skill.search(args.target, max_retries=0)
 
     print("\n========== 最终结果 ==========", file=sys.stderr)

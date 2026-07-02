@@ -129,12 +129,15 @@ class SearchSkill:
                 result["rotations_used"] = rotations_used
                 # 精对准：让机身正面正对目标
                 if align_fn is not None:
+                    logger.info(f"[search_with_scan] 找到目标，开始精对准")
                     result, aligned_views, aligned_times = self._align_to_target(
                         target, result, align_fn, camera_hfov_deg,
                         align_threshold, max_align_attempts, settle_s
                     )
                     views_used += aligned_views
                     alignments_used += aligned_times
+                else:
+                    logger.info(f"[search_with_scan] 找到目标，未提供 align_fn，跳过精对准")
                 result["views_used"] = views_used
                 result["rotations_used"] = rotations_used
                 result["alignments_used"] = alignments_used
