@@ -317,7 +317,7 @@ def _get_search_skill() -> "SearchSkill | None":
     if _search_skill is None and _SKILLS_AVAILABLE:
         va = _get_vision_adapter()
         if va is not None:
-            _search_skill = SearchSkill(va)
+            _search_skill = SearchSkill(va, provider="minimax")
     return _search_skill
 
 

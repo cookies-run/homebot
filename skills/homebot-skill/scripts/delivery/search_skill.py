@@ -159,17 +159,22 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
             return None
 
         try:
-            from configs.ai_config import get_ai_credentials
-            secrets = get_ai_credentials()
-            api_key = secrets.llm.api_key
-            api_url = secrets.llm.api_url or "https://api.minimax.chat"
+            # 优先使用 MiniMax 专属环境变量，避免 LLM 配置切换为 cctq 时密钥错误
+            api_key = os.getenv("MINIMAX_API_KEY") or os.getenv("MINIMAX_VISION_API_KEY")
+            api_host = os.getenv("MINIMAX_API_HOST") or os.getenv("MINIMAX_VISION_API_URL")
             if not api_key:
-                logger.error("LLM API Key 未配置")
+                from configs.ai_config import get_ai_credentials
+                secrets = get_ai_credentials()
+                api_key = secrets.llm.api_key
+                api_host = api_host or secrets.llm.api_url
+            api_host = api_host or "https://api.minimax.chat"
+            if not api_key:
+                logger.error("MiniMax API Key 未配置")
                 return None
 
             from urllib.parse import urlparse
-            parsed = urlparse(api_url)
-            host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme else api_url.rstrip("/v1")
+            parsed = urlparse(api_host)
+            host = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme else api_host.rstrip("/v1")
 
             with open(image_path, "rb") as f:
                 import base64
