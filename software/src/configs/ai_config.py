@@ -505,26 +505,26 @@ class LLMConfig:
 @dataclass
 class VisionConfig:
     """图片理解/Vision API配置
-    
-    支持多提供商: deepseek/qwen/openai
+
+    支持多提供商: minimax/deepseek/qwen/openai
     敏感信息从环境变量/.env.local 加载（见 get_ai_credentials）
     """
-    provider: str = "deepseek"                # 提供商
+    provider: str = "minimax"                # 提供商
     api_key: str = ""                         # API密钥
     api_url: str = ""                         # API地址
     model: str = ""                           # 模型名称
     temperature: float = 0.7                  # 温度参数
     max_tokens: int = 1024                    # 最大token数
-    
+
     def __post_init__(self):
         """从密钥管理加载配置"""
         creds = get_ai_credentials()
-        
+
         # 如果未指定provider，使用环境变量的配置
         env_provider = creds.vision.provider
         if env_provider:
             self.provider = env_provider
-        
+
         # 加载密钥和URL
         if creds.vision.api_key:
             self.api_key = creds.vision.api_key
@@ -532,23 +532,32 @@ class VisionConfig:
             self.api_url = creds.vision.api_url
         if creds.vision.model:
             self.model = creds.vision.model
-        
+
+        # MiniMax 视觉默认配置
+        if self.provider == "minimax":
+            if not self.api_key:
+                self.api_key = os.getenv("MINIMAX_API_KEY", "")
+            if not self.api_url:
+                self.api_url = os.getenv("MINIMAX_API_HOST", "") or "https://api.minimaxi.com"
+            if not self.model:
+                self.model = "MiniMax-M1-Vision"
+
         # 如果没有单独配置Vision，复用DeepSeek LLM配置
-        if self.provider == "deepseek":
+        elif self.provider == "deepseek":
             if not self.api_key:
                 self.api_key = creds.llm.api_key
             if not self.api_url:
                 self.api_url = creds.llm.api_url or "https://api.deepseek.com/v1"
             if not self.model:
                 self.model = "deepseek-chat"
-        
+
         # 提供商特定的默认配置
         elif self.provider == "qwen":
             if not self.api_url:
                 self.api_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             if not self.model:
                 self.model = "qwen-vl-plus"
-        
+
         elif self.provider == "openai":
             if not self.api_url:
                 self.api_url = "https://api.openai.com/v1"

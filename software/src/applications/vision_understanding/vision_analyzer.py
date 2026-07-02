@@ -47,8 +47,8 @@ DEFAULT_CCTQ_BASE_URL = "https://www.cctq.ai/v1"
 class VisionAnalyzer:
     """视觉分析器 - 捕获视频帧并进行 AI 分析
 
-    支持多提供商：cctq(gpt-5.5) / MiniMax / 火山Ark / OpenAI，通过 VISION_PROVIDER
-    环境变量切换。provider=cctq 时以 gpt-5.5 为主，失败自动回退 MiniMax。
+    支持多提供商：minimax / cctq(gpt-5.5) / 火山Ark / OpenAI，通过 VISION_PROVIDER
+    环境变量切换。provider=minimax 时优先使用 MiniMax，失败自动回退其他 provider。
     """
 
     def __init__(
@@ -72,7 +72,7 @@ class VisionAnalyzer:
         self.timeout_ms = timeout_ms
 
         # 提供商选择
-        self.provider = os.getenv("VISION_PROVIDER", "cctq")
+        self.provider = os.getenv("VISION_PROVIDER", "minimax")
         secrets = get_ai_credentials()
 
         # ---------- MiniMax 配置 ----------
