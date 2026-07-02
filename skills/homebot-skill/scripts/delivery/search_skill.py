@@ -214,21 +214,25 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
             logger.info(f"[_call_minimax] HTTP status={resp.status_code}, url={host}/v1/coding_plan/vlm")
             resp.raise_for_status()
             data = resp.json()
+            logger.info(f"[_call_minimax] 响应体: {data}")
 
-            # MiniMax 标准错误封装：base_resp.code != 0 时有效返回在 data.choices[0].message.content
+            # MiniMax 标准错误封装
             base_resp = data.get("base_resp") or {}
-            if base_resp.get("status_code", 0) != 0 or base_resp.get("code", 0) != 0:
+            status_code = base_resp.get("status_code") or base_resp.get("code") or 0
+            if status_code != 0:
                 logger.error(
                     f"[_call_minimax] MiniMax 接口返回错误: "
                     f"status_code={base_resp.get('status_code')}, code={base_resp.get('code')}, "
                     f"status_msg={base_resp.get('status_msg', '')}"
                 )
 
-            # 兼容多种返回结构：原生 /v1/coding_plan/vlm 的 data.text，
+            # 兼容多种返回结构：原生 /v1/coding_plan/vlm 的 data.content / data.text，
             # 以及 OpenAI-compatible 格式的 data.choices[0].message.content
             text = ""
             if isinstance(data, dict):
-                if "text" in data:
+                if "content" in data and data["content"]:
+                    text = data["content"]
+                elif "text" in data and data["text"]:
                     text = data["text"]
                 elif "choices" in data and isinstance(data["choices"], list):
                     choice = data["choices"][0]
@@ -236,7 +240,10 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
                         message = choice.get("message", {})
                         text = message.get("content", "") if isinstance(message, dict) else ""
 
-            logger.info(f"[_call_minimax] 模型原始返回: {text}")
+            if not text:
+                logger.warning(f"[_call_minimax] 模型返回内容为空，请检查响应体结构: {data}")
+
+            logger.info(f"[_call_minimax] 提取到的模型原始返回: {text}")
             parsed = self._parse_json(text)
             logger.info(f"[_call_minimax] 解析后结果: {parsed}")
             if parsed and "scene_description" not in parsed:
