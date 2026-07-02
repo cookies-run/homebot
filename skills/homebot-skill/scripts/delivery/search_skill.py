@@ -45,9 +45,11 @@ class SearchSkill:
         if self.vision_adapter is None:
             return {"found": False, "reason": "视觉适配器未初始化"}
 
+        last_reason = "多次尝试未在画面中找到目标"
         for attempt in range(max_retries + 1):
             frame_id, frame = self.vision_adapter.read_frame()
             if frame is None:
+                last_reason = "未读取到摄像头画面（机身摄像头无帧）"
                 time.sleep(0.2)
                 continue
 
@@ -55,10 +57,14 @@ class SearchSkill:
             cv2.imwrite(path, frame)
 
             result = self._call_vlm(path, target)
-            if result and result.get("found"):
+            if result is None:
+                last_reason = "VLM 无响应或返回无法解析（可能被截断/非 JSON）"
+                continue
+            if result.get("found"):
                 return result
+            last_reason = result.get("reason") or "模型判定画面中无该目标"
 
-        return {"found": False, "reason": "多次尝试未在画面中找到目标"}
+        return {"found": False, "reason": last_reason}
 
     def search_with_scan(self, target: str, rotate_fn, rotate_deg: float = 120.0,
                          max_rotations: int = 3, settle_s: float = 0.6) -> dict:
@@ -88,7 +94,8 @@ class SearchSkill:
         views_used = 0
         rotations_used = 0
         while True:
-            result = self.search(target)
+            # 每个朝向只取一帧分析一次；转一圈已覆盖各角度，无需在原地重复截帧
+            result = self.search(target, max_retries=0)
             views_used += 1
             if result.get("found"):
                 result["graspable"] = self.check_graspable(result).get("graspable", False)
@@ -120,17 +127,20 @@ class SearchSkill:
 
     def _call_vlm(self, image_path: str, target: str) -> Optional[dict]:
         """调用 VLM 搜索目标。"""
-        prompt = f'''你是机器人的高精度视觉定位助手。请在图片中找到目标物体"{target}"，并只返回以下 JSON：
+        prompt = f'''你是机器人视觉定位助手。判断图片中是否存在目标物体："{target}"。
 
+匹配放宽：允许近义词/同类物体、部分遮挡、侧放或倒放、处于远处的小目标——只要能合理相信它就是该物体即可判定存在；画面中有多个时，选最可能、最完整的一个。是否存在只取决于能否看到该物体，不要因为估不出高度或姿态而判定为不存在。
+
+仅输出以下 JSON，不要 markdown 代码块、不要解释、不要多余文字：
 {{
   "found": true/false,
   "bbox": [x1, y1, x2, y2],
-  "height_cm": 估计的高度厘米数（可选）,
   "pose": "upright" | "fallen" | "unknown",
+  "height_cm": 估计高度厘米数（可选，估不出填 null）,
   "reason": "简短说明"
 }}
 
-其中 bbox 为 0~1 归一化坐标。只输出 JSON，不要 Markdown 代码块、解释或任何额外文字。'''
+bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, 右, 下]。'''
 
         try:
             if self.provider == "minimax":
@@ -201,7 +211,7 @@ class SearchSkill:
                     ]}
                 ],
                 temperature=0.1,
-                max_tokens=256,
+                max_tokens=1024,
                 top_p=0.9,
             )
             text = response["choices"][0]["message"]["content"] or ""
