@@ -39,6 +39,7 @@ class SearchSkill:
                 "bbox": [x1, y1, x2, y2] normalized,
                 "height_cm": float,
                 "pose": "upright" | "fallen" | "unknown",
+                "scene_description": str,  # 对整张画面内容的简短描述
                 "reason": str
             }
         """
@@ -64,7 +65,9 @@ class SearchSkill:
                 last_reason = "VLM 无响应或返回无法解析（可能被截断/非 JSON）"
                 logger.warning(f"[search] VLM 返回 None，继续尝试")
                 continue
+            scene_desc = result.get("scene_description") or "（模型未返回画面描述）"
             logger.info(f"[search] VLM 返回结果: {result}")
+            logger.info(f"[search] 模型对画面描述: {scene_desc}")
             if result.get("found"):
                 logger.info(f"[search] ✅ 找到目标: {target}")
                 return result
@@ -95,6 +98,7 @@ class SearchSkill:
                 "views_used": int,       # 实际分析的画面数
                 "rotations_used": int,   # 实际成功旋转的次数
                 "bbox": [...], "height_cm": float, "pose": str,
+                "scene_description": str,  # 对整张画面内容的简短描述
                 "graspable": bool,
                 "reason": str
             }
@@ -154,10 +158,11 @@ class SearchSkill:
   "bbox": [x1, y1, x2, y2],
   "pose": "upright" | "fallen" | "unknown",
   "height_cm": 估计高度厘米数（可选，估不出填 null）,
+  "scene_description": "对整张画面内容的简短描述，例如'办公室场景，中央椅子上有蓝色纸巾盒'",
   "reason": "简短说明"
 }}
 
-bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, 右, 下]。'''
+bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, 右, 下]。scene_description 描述整张画面，不要只描述目标。'''
 
         try:
             if self.provider == "minimax":
@@ -213,6 +218,8 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
             logger.info(f"[_call_minimax] 模型原始返回: {text}")
             parsed = self._parse_json(text)
             logger.info(f"[_call_minimax] 解析后结果: {parsed}")
+            if parsed and "scene_description" not in parsed:
+                parsed["scene_description"] = "（模型未返回画面描述）"
             return parsed
         except Exception as e:
             logger.error(f"MiniMax VLM 失败: {e}")
@@ -246,6 +253,8 @@ bbox 用图片左上角为原点的 0~1 归一化坐标，顺序为 [左, 上, �
             logger.info(f"[_call_openai_compatible] 模型原始返回: {text}")
             parsed = self._parse_json(text)
             logger.info(f"[_call_openai_compatible] 解析后结果: {parsed}")
+            if parsed and "scene_description" not in parsed:
+                parsed["scene_description"] = "（模型未返回画面描述）"
             return parsed
         except Exception as e:
             logger.error(f"OpenAI-compatible VLM 失败: {e}")

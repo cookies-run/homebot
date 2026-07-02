@@ -360,8 +360,9 @@ async def search_target(
     一个目标——需要同时定位抓取目标和递送目标时，请分两次调用本工具。
 
     返回 JSON 字段：found(是否找到)、bbox(归一化 xyxy 位置)、height_cm(估计高度)、
-    pose(姿态)、graspable(是否可抓)、views_used(实际搜索画面数)、rotations_used(实际
-    成功旋转次数)。found=false 时由调用方决定是否移动到别处再搜。
+    pose(姿态)、scene_description(模型对整张画面的描述)、graspable(是否可抓)、
+    views_used(实际搜索画面数)、rotations_used(实际成功旋转次数)。found=false 时由调用方
+    决定是否移动到别处再搜。
 
     典型触发语句:
         - "帮我找一下那包纸巾"
