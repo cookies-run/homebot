@@ -131,6 +131,9 @@ class TargetTracker:
         TargetTracker._id_counter = 0
         self._candidate_counter = 0
 
+    def get_primary_target(self) -> Optional[Target]:
+        return self.primary_target
+
     def _create_target(self, detection: Detection) -> Target:
         TargetTracker._id_counter += 1
         target = Target(
