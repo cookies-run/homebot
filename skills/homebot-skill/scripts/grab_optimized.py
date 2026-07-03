@@ -426,10 +426,14 @@ class AutoGrabWorkflow:
         print("[GRAB] [Tracker][WARN] 当前 OpenCV 版本没有可用的传统追踪器")
         return None
 
-    def _init_tracker(self, tracker_attr: str, frame_bgr: np.ndarray, bbox_xyxy: tuple) -> bool:
-        """用 bbox（像素坐标 xyxy）初始化指定 Tracker"""
+    def _init_tracker(self, tracker_attr: str, frame_bgr: np.ndarray, bbox_xyxy: tuple) -> tuple[bool, str]:
+        """用 bbox（像素坐标 xyxy）初始化指定 Tracker。
+
+        Returns:
+            (ok, reason): reason 仅在失败时返回，用于上层做更清晰的诊断。
+        """
         if frame_bgr is None:
-            return False
+            return False, "输入帧为空"
         x1, y1, x2, y2 = bbox_xyxy
         h, w = frame_bgr.shape[:2]
         x = max(0, int(x1))
@@ -437,12 +441,13 @@ class AutoGrabWorkflow:
         bw = min(int(x2 - x1), w - x - 1)
         bh = min(int(y2 - y1), h - y - 1)
         if bw <= 2 or bh <= 2:
-            print(f"[GRAB] [Tracker] 初始框无效: x={x}, y={y}, w={bw}, h={bh}")
-            return False
+            reason = f"初始框无效: x={x}, y={y}, w={bw}, h={bh}"
+            print(f"[GRAB] [Tracker] {reason}")
+            return False, reason
 
         tracker = self._create_tracker()
         if tracker is None:
-            return False
+            return False, "OpenCV 无可用的传统追踪器（请确认已安装 opencv-contrib-python）"
 
         try:
             tracker.init(frame_bgr, (x, y, bw, bh))
@@ -451,10 +456,11 @@ class AutoGrabWorkflow:
             setattr(self, f"{tracker_attr}_initialized", True)
             setattr(self, f"{tracker_attr}_lost_count", 0)
             print(f"[GRAB] [Tracker] ✅ 追踪器已初始化，初始框=({x},{y},{bw},{bh})")
-            return True
+            return True, ""
         except Exception as e:
-            print(f"[GRAB] [Tracker] ❌ 追踪器初始化失败: {e}")
-            return False
+            reason = f"tracker.init() 异常: {e}"
+            print(f"[GRAB] [Tracker] ❌ {reason}")
+            return False, reason
 
     def _update_tracker(self, tracker_attr: str, frame_bgr: np.ndarray) -> tuple[bool, tuple | None]:
         """更新指定 Tracker，返回 (success, bbox_xywh)
@@ -528,21 +534,29 @@ class AutoGrabWorkflow:
         width_ratio = (x2 - x1) / img_w
         return (float(x1), float(y1), float(x2), float(y2)), cx_ratio, cy_ratio, area_ratio, y2_ratio, width_ratio
 
-    def _save_debug_frame(self, frame_bgr: np.ndarray, bbox_xyxy: tuple, label: str, metrics: dict):
-        """保存带追踪框和指标的调试图"""
-        if not _CV2_AVAILABLE or frame_bgr is None or bbox_xyxy is None:
+    def _save_debug_frame(self, frame_bgr: np.ndarray, bbox_xyxy: tuple | None, label: str, metrics: dict):
+        """保存带追踪框和指标的调试图。bbox_xyxy 为 None 时只保存原图与文字。"""
+        if not _CV2_AVAILABLE or frame_bgr is None:
             return
         try:
             debug = frame_bgr.copy()
-            x1, y1, x2, y2 = map(int, bbox_xyxy)
-            cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            text = (
-                f"area={metrics.get('area_ratio', 0):.3f} "
-                f"cx={metrics.get('center_x_ratio', 0):.3f} "
-                f"y2={metrics.get('y2_ratio', 0):.3f}"
-            )
+            if bbox_xyxy is not None:
+                x1, y1, x2, y2 = map(int, bbox_xyxy)
+                cv2.rectangle(debug, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            text_parts = []
+            for key in ("area_ratio", "center_x_ratio", "y2_ratio"):
+                val = metrics.get(key)
+                if val is not None:
+                    text_parts.append(f"{key.split('_')[0]}={val:.3f}")
+            reason = metrics.get("reason")
+            if reason:
+                text_parts.append(str(reason))
+            if not text_parts:
+                text_parts.append(str(metrics))
+            text = " ".join(text_parts)
+            # 在左上角显示文字，避免 bbox 为 None 时越界
             cv2.putText(
-                debug, text, (x1, max(y1 - 10, 20)),
+                debug, text, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
             )
             # 中间过程调试图与关键帧放到同一目录，按 run 保留
@@ -1136,6 +1150,7 @@ class AutoGrabWorkflow:
                         x1, y1, x2, y2 = bbox
                         bbox_xyxy = (x1 * w, y1 * h, x2 * w, y2 * h)
                         self._init_tracker("_body_tracker", frame_bgr, bbox_xyxy)
+                        # Phase 1 对 tracker 初始化失败不敏感，后续循环会重试
 
             # 无 tracker 则失败（Phase 1 不应 fallback 到距离分析，避免额外 VLM）
             if metrics is None:
@@ -1250,6 +1265,80 @@ class AutoGrabWorkflow:
             (cy + end_h_ratio / 2) * h,
         )
 
+    def _phase2_vlm_center_x(self, image_path: str, frame_bgr: np.ndarray, target_object: str) -> float | None:
+        """用 VLM 定位目标并返回其水平中心比例 (cx_ratio)，失败返回 None。"""
+        detection = self._vlm_locate_target(image_path, target_object)
+        if detection is None or "bbox" not in detection:
+            return None
+        bbox = detection["bbox"]
+        valid, reason = self._validate_vlm_bbox(bbox)
+        if not valid:
+            print(f"[GRAB] [Phase2] VLM-only 框校验失败（{reason}）")
+            return None
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = bbox
+        cx_ratio = ((x1 + x2) / 2.0)
+        if cx_ratio > 1.0:
+            # VLM 返回的是 0~1000 整数坐标
+            cx_ratio = cx_ratio / 1000.0
+        print(f"[GRAB] [Phase2] VLM-only: bbox={bbox}, cx_ratio={cx_ratio:.3f}")
+        self._save_debug_frame(frame_bgr,
+                                (x1 * w, y1 * h, x2 * w, y2 * h),
+                                "phase2_vlm_only",
+                                {"center_x_ratio": cx_ratio})
+        return cx_ratio
+
+    def _phase2_vlm_only_align(self, target_object: str, max_attempts: int = 3) -> bool:
+        """Tracker 初始化失败时，用 VLM 直接做水平 base 对准。
+
+        Returns:
+            True 表示对准成功或已足够居中；False 表示 VLM 连续失败。
+        """
+        print("[GRAB] [Phase2] VLM-only base 对准开始")
+        KP_BASE = 6.0
+        current_angles = self.get_current_angles()
+        current_base = current_angles.get("base", OBSERVATION_POSE.get("base", -90))
+        ever_located = False
+
+        for attempt in range(1, max_attempts + 1):
+            img_path, frame_bgr = self.capture_end(f"phase2_vlm_align_{attempt}")
+            if frame_bgr is None:
+                continue
+            cx_ratio = self._phase2_vlm_center_x(img_path, frame_bgr, target_object)
+            if cx_ratio is None:
+                print(f"[GRAB] [Phase2] VLM-only 第 {attempt}/{max_attempts} 次定位失败")
+                continue
+
+            ever_located = True
+            error_x = cx_ratio - 0.5
+            if abs(error_x) <= 0.08:
+                print("[GRAB] [Phase2] VLM-only 水平已对准")
+                return True
+
+            base_offset = error_x * KP_BASE
+            base_offset = max(0.1, min(2.0, abs(base_offset))) * (1 if base_offset > 0 else -1)
+            new_base = current_base + base_offset
+            new_base = self.clamp(new_base, _JOINT_LIMITS["base"][0], _JOINT_LIMITS["base"][1])
+            print(f"[GRAB] [Phase2] VLM-only base 微调: {current_base:.1f}° -> {new_base:.1f}°")
+
+            align_pose = {
+                "base": new_base,
+                "shoulder": current_angles.get("shoulder", 0),
+                "elbow": current_angles.get("elbow", 150),
+                "wrist_flex": current_angles.get("wrist_flex", 30),
+                "wrist_roll": _GRAB_WRIST_ROLL,
+                "gripper": 90,
+            }
+            self._move_to_pose(align_pose, "Phase2 VLM-only base 微调", wait=0.8)
+            current_base = new_base
+
+        if ever_located:
+            # 即便最后一次没对准，只要至少成功定位过一次就放行，Phase 3 会再用 VLM 补偿
+            print("[GRAB] [Phase2] VLM-only 对准次数用尽，按当前状态放行")
+            return True
+        print("[GRAB] [Phase2] VLM-only 连续定位失败")
+        return False
+
     def _phase2_approach_and_deploy(self, target_object: str) -> dict:
         """Phase 2: 末端摄像头 Tracker base 对准 + 手腕姿态预部署"""
         print("\n[GRAB] ====== Phase 2: 接近与手腕姿态预部署 ======")
@@ -1312,21 +1401,35 @@ class AutoGrabWorkflow:
                 else:
                     print(f"[GRAB] [Phase2] VLM 定位 bbox: {vlm_bbox} (无 grasp_center)")
 
-                ok = self._init_tracker("_end_tracker", init_frame_bgr, vlm_bbox)
+                ok, init_reason = self._init_tracker("_end_tracker", init_frame_bgr, vlm_bbox)
             else:
                 print(f"[GRAB] [ERR] Phase 2 VLM 框尺寸或比例异常，判定为幻觉（{reason}），回退到几何投影")
 
         if not ok:
             print("[GRAB] [Phase2] VLM 定位失败或 Tracker 初始化失败，回退到几何投影")
             projected_bbox = self._project_bbox_to_end_camera(init_frame_bgr)
-            ok = self._init_tracker("_end_tracker", init_frame_bgr, projected_bbox)
+            ok, init_reason = self._init_tracker("_end_tracker", init_frame_bgr, projected_bbox)
         if not ok:
             # fallback 中心框
             h, w = init_frame_bgr.shape[:2]
             fallback_bbox = (w * 0.35, h * 0.4, w * 0.65, h * 0.7)
-            ok = self._init_tracker("_end_tracker", init_frame_bgr, fallback_bbox)
+            ok, init_reason = self._init_tracker("_end_tracker", init_frame_bgr, fallback_bbox)
         if not ok:
-            return {"success": False, "message": "Phase 2 end Tracker 初始化失败"}
+            # 所有 Tracker 初始化源都失败（常见原因：低纹理物体如纸巾/ OpenCV 追踪器不可用）
+            # 保存失败现场后，尝试 VLM-only 对准，而不是直接失败。
+            self._save_debug_frame(init_frame_bgr, None, "phase2_tracker_init_failed",
+                                    {"reason": init_reason, "vlm_bbox": vlm_bbox})
+            print(f"[GRAB] [Phase2] ⚠️ end Tracker 全部初始化失败: {init_reason}")
+            print("[GRAB] [Phase2] 回退到 VLM-only 水平对准")
+            vlm_ok = self._phase2_vlm_only_align(target_object)
+            if not vlm_ok:
+                return {
+                    "success": False,
+                    "message": f"Phase 2 end Tracker 初始化失败 ({init_reason})，且 VLM-only 对准失败",
+                }
+            # VLM-only 对准成功：标记 tracker 未初始化，让 Phase 3 用 VLM 重定位
+            self._end_tracker_initialized = False
+            print("[GRAB] [Phase2] VLM-only 对准完成，后续进入 Phase 3 由 VLM 重定位补偿")
 
         # 记录当前 base（后续微调只改 base）
         scout_pose = self.get_current_angles()
@@ -1344,18 +1447,26 @@ class AutoGrabWorkflow:
             if frame_bgr is None:
                 continue
 
-            ok, bbox_xywh = self._update_tracker("_end_tracker", frame_bgr)
-            if not ok:
-                print("[GRAB] [Phase2] end Tracker 丢失")
-                if self._end_tracker_lost_count >= 3:
-                    return {"success": False, "message": "Phase 2 end Tracker 持续丢失"}
-                continue
+            # 如果 Tracker 未初始化（VLM-only 回退），每轮用 VLM 定位获取水平误差
+            if not self._end_tracker_initialized:
+                cx_ratio = self._phase2_vlm_center_x(img_path, frame_bgr, target_object)
+                if cx_ratio is None:
+                    print("[GRAB] [Phase2] VLM 定位失败，跳过本次")
+                    continue
+                bbox_xyxy = None
+            else:
+                ok, bbox_xywh = self._update_tracker("_end_tracker", frame_bgr)
+                if not ok:
+                    print("[GRAB] [Phase2] end Tracker 丢失")
+                    if self._end_tracker_lost_count >= 3:
+                        return {"success": False, "message": "Phase 2 end Tracker 持续丢失"}
+                    continue
 
-            h, w = frame_bgr.shape[:2]
-            bbox_xyxy, cx_ratio, cy_ratio, area_ratio, y2_ratio, width_ratio = self._tracker_metrics(bbox_xywh, w, h)
-            metrics = {"center_x_ratio": cx_ratio, "center_y_ratio": cy_ratio, "area_ratio": area_ratio, "y2_ratio": y2_ratio, "width_ratio": width_ratio}
-            print(f"[GRAB] [Phase2] Tracker: cx={cx_ratio:.3f}, cy={cy_ratio:.3f}, area={area_ratio:.3f}, y2={y2_ratio:.3f}, w={width_ratio:.3f}")
-            self._save_debug_frame(frame_bgr, bbox_xyxy, f"phase2_align_{attempt}", metrics)
+                h, w = frame_bgr.shape[:2]
+                bbox_xyxy, cx_ratio, cy_ratio, area_ratio, y2_ratio, width_ratio = self._tracker_metrics(bbox_xywh, w, h)
+                metrics = {"center_x_ratio": cx_ratio, "center_y_ratio": cy_ratio, "area_ratio": area_ratio, "y2_ratio": y2_ratio, "width_ratio": width_ratio}
+                print(f"[GRAB] [Phase2] Tracker: cx={cx_ratio:.3f}, cy={cy_ratio:.3f}, area={area_ratio:.3f}, y2={y2_ratio:.3f}, w={width_ratio:.3f}")
+                self._save_debug_frame(frame_bgr, bbox_xyxy, f"phase2_align_{attempt}", metrics)
 
             error_x = cx_ratio - 0.5
             if abs(error_x) <= 0.06:
@@ -1469,7 +1580,7 @@ class AutoGrabWorkflow:
             h, w = frame_bgr.shape[:2]
             x1, y1, x2, y2 = bbox
             vlm_bbox = (x1 * w, y1 * h, x2 * w, y2 * h)
-            ok = self._init_tracker("_end_tracker", frame_bgr, vlm_bbox)
+            ok, _ = self._init_tracker("_end_tracker", frame_bgr, vlm_bbox)
             if ok:
                 print(f"[GRAB] [Phase3] ✅ VLM 重定位成功，新框=({vlm_bbox[0]:.1f}, {vlm_bbox[1]:.1f}, "
                       f"{vlm_bbox[2]:.1f}, {vlm_bbox[3]:.1f})")
