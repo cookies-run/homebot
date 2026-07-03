@@ -36,7 +36,8 @@ class ApproachSkill:
                  kp_angular: float = 1.5,
                  dead_zone_x: float = 0.15,
                  dead_zone_area: float = 0.1,
-                 target_area_at_30cm: float = 0.08):
+                 target_area_at_30cm: float = 0.08,
+                 distance_tolerance_cm: float = 10.0):
         self.chassis = chassis_adapter
         self.vision = vision_adapter
         self.approach_distance_cm = approach_distance_cm
@@ -47,7 +48,12 @@ class ApproachSkill:
         self.dead_zone_x = dead_zone_x
         self.dead_zone_area = dead_zone_area
         self.target_area_at_30cm = target_area_at_30cm
+        self.distance_tolerance_cm = distance_tolerance_cm
         self.tracker = TargetTracker(selection_strategy="center")
+
+    def _estimate_distance_cm(self, area: float) -> float:
+        """根据目标在画面中的面积估算距离。"""
+        return self.approach_distance_cm * (self.target_area_at_30cm / max(area, 1e-6)) ** 0.5
 
     def approach(self,
                  target_bbox: Tuple[float, float, float, float],
@@ -133,7 +139,17 @@ class ApproachSkill:
             # 到达目标距离
             if area >= self.target_area_at_30cm and abs(error_x) <= self.dead_zone_x:
                 self.chassis.stop()
-                estimated_distance = self.approach_distance_cm * (self.target_area_at_30cm / max(area, 1e-6)) ** 0.5
+                estimated_distance = self._estimate_distance_cm(area)
+                return {
+                    "success": True,
+                    "message": f"已接近目标到约 {estimated_distance:.1f}cm",
+                    "final_distance_cm": estimated_distance,
+                }
+
+            # 距离已经比较接近，无需继续微调，避免超时
+            estimated_distance = self._estimate_distance_cm(area)
+            if estimated_distance <= self.approach_distance_cm + self.distance_tolerance_cm:
+                self.chassis.stop()
                 return {
                     "success": True,
                     "message": f"已接近目标到约 {estimated_distance:.1f}cm",
@@ -146,6 +162,18 @@ class ApproachSkill:
             time.sleep(0.05)
 
         self.chassis.stop()
+        # 超时但距离已足够近，视为成功
+        target = self.tracker.get_primary_target()
+        if target is None:
+            target = self.tracker.targets[0] if self.tracker.targets else None
+        if target is not None:
+            estimated_distance = self._estimate_distance_cm(target.area)
+            if estimated_distance <= self.approach_distance_cm + self.distance_tolerance_cm:
+                return {
+                    "success": True,
+                    "message": f"已接近目标到约 {estimated_distance:.1f}cm（接近超时但距离可接受）",
+                    "final_distance_cm": estimated_distance,
+                }
         return {"success": False, "message": "接近目标超时"}
 
     def rotate_search(self, step_deg: float = 30.0) -> dict:
