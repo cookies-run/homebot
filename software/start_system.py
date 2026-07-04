@@ -29,8 +29,15 @@ SERVICES = [
         "name": "Vision Service",
         "module": "services.vision_service",
         "port": 5560,
-        "desc": "Vision Service",
-        "args": ["--device-name", "1080P USB Camera"]
+        "desc": "Body Camera Vision Service",
+        "args": ["--addr", "tcp://*:5560", "--device", "1"]
+    },
+    {
+        "name": "End Vision Service",
+        "module": "services.vision_service",
+        "port": 5561,
+        "desc": "End Camera Vision Service",
+        "args": ["--addr", "tcp://*:5561", "--device-name", "USB摄像头"]
     },
     {
         "name": "WakeupASR Service",
@@ -48,9 +55,14 @@ SERVICES = [
     {
         "name": "Web Control",
         "module": "applications.remote_control",
-        "port": 5001,
+        "port": 5002,
         "desc": "Web Server",
-        "args": ["--host", "0.0.0.0", "--port", "5001"]
+        "args": [
+            "--host", "0.0.0.0",
+            "--port", "5002",
+            "--vision", "tcp://127.0.0.1:5560",
+            "--end-vision", "tcp://127.0.0.1:5561"
+        ]
     }
 ]
 
@@ -342,10 +354,10 @@ def main():
     print()
 
     # 从 SERVICES 中获取 Web 控制端的实际端口
-    web_port = 5001
+    web_port = 5002
     for svc in SERVICES:
         if svc["name"] == "Web Control":
-            web_port = svc.get("port", 5001)
+            web_port = svc.get("port", 5002)
             break
 
     # 获取局域网IP
@@ -362,7 +374,8 @@ def main():
     print(f"   本机:     http://localhost:{web_port}")
     if lan_ip != "127.0.0.1":
         print(f"   局域网:   http://{lan_ip}:{web_port}")
-    print(f"   视频流:   http://localhost:{web_port}/video_feed")
+    print(f"   机身视频: http://localhost:{web_port}/video_feed")
+    print(f"   末端视频: http://localhost:{web_port}/end_video_feed")
     print("=" * 50)
     print()
     print("按 Ctrl+C 停止所有服务")

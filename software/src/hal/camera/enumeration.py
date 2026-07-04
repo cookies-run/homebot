@@ -98,22 +98,138 @@ def _list_cameras_linux() -> List[Dict]:
 
 
 def _list_cameras_windows() -> List[Dict]:
-    """Windows: OpenCV 不直接提供设备名，先按索引枚举。"""
+    """Windows: 优先枚举真实设备名，再映射到 OpenCV DirectShow 索引。"""
+    import logging
+
+    logger = logging.getLogger(__name__)
+    open_indices = _probe_windows_camera_indices()
+
+    real_names = _list_windows_camera_names()
+    if real_names:
+        # Windows PnP 枚举已过滤掉笔记本内置/音频设备；OpenCV 可读索引中
+        # 仍可能夹着内置摄像头。实际在 Windows 10 上观测到：外接机身摄像头
+        # 在 DSHOW index 0，笔记本摄像头在 index 1，末端摄像头在 MSMF/ANY
+        # index 2。因此不要简单尾部对齐，否则会把机身摄像头错配到笔记本。
+        devices = _map_windows_camera_names_to_indices(real_names, open_indices)
+        if len(real_names) != len(open_indices):
+            logger.warning(
+                "[CameraEnum] Windows camera name count (%s) differs from readable OpenCV index count (%s); "
+                "using role-aware external camera mapping: names=%s, indices=%s, devices=%s",
+                len(real_names), len(open_indices), real_names, open_indices, devices,
+            )
+        return devices
+
+    logger.warning("[CameraEnum] Windows real-name enumeration unavailable; falling back to Camera N labels")
+    return [{'index': i, 'name': f'Camera {i}'} for i in open_indices]
+
+
+def _probe_windows_camera_indices() -> List[int]:
+    """探测 Windows 上可读取画面的 OpenCV 摄像头索引。"""
     import cv2
-    devices = []
+
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    indices = []
     for i in range(10):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            devices.append({'index': i, 'name': f'Camera {i}'})
+        for backend in backends:
+            cap = cv2.VideoCapture(i, backend)
+            ok = cap.isOpened()
+            ret = False
+            if ok:
+                ret, frame = cap.read()
+                ret = ret and frame is not None
             cap.release()
-    return devices
+            if ret:
+                indices.append(i)
+                break
+    return indices
+
+
+def _map_windows_camera_names_to_indices(names: List[str], indices: List[int]) -> List[Dict]:
+    """按 HomeBot 摄像头角色把 Windows 真实名称映射到 OpenCV 索引。"""
+    if not names:
+        return []
+
+    # 当前 HomeBot Windows 设备形态：过滤内置/音频设备后，真实名称通常只剩
+    # 机身 1080P USB Camera 和末端 USB Camera；OpenCV 可读索引仍可能包含
+    # 笔记本摄像头。实测 /run 启动时 index 0 会落到笔记本，末端在最后一路，
+    # 因此 3 路可读时跳过 index 0：机身取中间一路，末端取最后一路。
+    if len(names) == 2 and len(indices) >= 3:
+        return [
+            {'index': indices[1], 'name': names[0]},
+            {'index': indices[-1], 'name': names[1]},
+        ]
+
+    if len(indices) >= len(names):
+        selected_indices = indices[:len(names)]
+    else:
+        selected_indices = indices + list(range(len(indices), len(names)))
+
+    return [
+        {'index': selected_indices[pos], 'name': name}
+        for pos, name in enumerate(names)
+    ]
+
+
+def _list_windows_camera_names() -> List[str]:
+    """通过 PowerShell/CIM 获取 Windows 摄像头真实名称。"""
+    script = r"""
+$devices = Get-CimInstance Win32_PnPEntity |
+    Where-Object {
+        $_.Name -and
+        $_.Name -notmatch 'audio|microphone|麦克风|音频|integrated|built-in|builtin|内置|facetime' -and
+        (
+            $_.PNPClass -eq 'Camera' -or
+            $_.PNPClass -eq 'Image' -or
+            (
+                $_.PNPClass -notin @('AudioEndpoint', 'MEDIA') -and
+                $_.Name -match 'camera|摄像头|webcam|usb video|usb2\.0|1080p'
+            )
+        )
+    } |
+    Select-Object -ExpandProperty Name
+$devices | ConvertTo-Json -Compress
+""".strip()
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', script],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, str):
+            names = [data]
+        else:
+            names = [str(item) for item in data if item]
+        return _dedupe_names(names)
+    except Exception:
+        return []
+
+
+def _dedupe_names(names: List[str]) -> List[str]:
+    """保留顺序去重。"""
+    seen = set()
+    result = []
+    for name in names:
+        normalized = _normalize_camera_name(name)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(name.strip())
+    return result
+
+
+def _normalize_camera_name(name: str) -> str:
+    """统一摄像头名称，便于跨平台不区分大小写/空白/中英文后缀匹配。"""
+    normalized = str(name or '').strip().casefold()
+    normalized = normalized.replace('摄像头', 'camera')
+    return re.sub(r'\s+', '', normalized)
 
 
 def find_camera_index(name_substring: str) -> Optional[int]:
-    """根据摄像头名称子串查找对应的 OpenCV 设备索引（非 macOS 场景使用）。
+    """根据摄像头名称查找对应的 OpenCV 设备索引（非 macOS 场景使用）。
 
     Args:
-        name_substring: 名称子串，不区分大小写。例如 "USB"、"FaceTime"。
+        name_substring: 名称或子串，不区分大小写。例如 "USB"、"FaceTime"。
 
     Returns:
         匹配到的设备索引；如果未找到则返回 None。
@@ -122,12 +238,31 @@ def find_camera_index(name_substring: str) -> Optional[int]:
         在 macOS 上建议直接使用 ``AVFoundationCameraDriver``，按
         ``device_name`` 或 ``unique_id`` 匹配，而不是 OpenCV 整数索引。
     """
+    import logging
+
+    logger = logging.getLogger(__name__)
     devices = list_camera_devices()
-    for dev in devices:
-        if name_substring.lower() in dev['name'].lower():
-            # 旧 API 兼容：macOS 的 AVFoundation 结果没有 index，返回 -1 表示
-            # "应使用 AVFoundation 原生驱动而非 OpenCV"。
-            return dev.get('index', -1)
+    target = _normalize_camera_name(name_substring)
+    if not target:
+        return None
+
+    exact_matches = [dev for dev in devices if _normalize_camera_name(dev.get('name', '')) == target]
+    if exact_matches:
+        if len(exact_matches) > 1:
+            logger.warning("[CameraEnum] Multiple exact camera matches for '%s': %s", name_substring, exact_matches)
+        return exact_matches[0].get('index', -1)
+
+    substring_matches = [dev for dev in devices if target in _normalize_camera_name(dev.get('name', ''))]
+    if substring_matches:
+        if len(substring_matches) > 1:
+            logger.warning("[CameraEnum] Multiple substring camera matches for '%s': %s", name_substring, substring_matches)
+        return substring_matches[0].get('index', -1)
+
+    reverse_matches = [dev for dev in devices if _normalize_camera_name(dev.get('name', '')) in target]
+    if reverse_matches:
+        logger.warning("[CameraEnum] Using weak reverse camera-name match for '%s': %s", name_substring, reverse_matches)
+        return reverse_matches[0].get('index', -1)
+
     return None
 
 
@@ -188,9 +323,21 @@ def resolve_device_id(config) -> int:
         if idx is not None:
             return idx
         import logging
-        logging.getLogger(__name__).warning(
-            f"Camera name '{device_name}' not found, falling back to device_id"
-        )
+        fallback_id = getattr(config.camera, 'device_id', 0) if hasattr(config, 'camera') else 0
+        devices = list_camera_devices()
+        if devices:
+            device_lines = "\n".join(
+                f"[{dev.get('index', 'name')}] {dev.get('name', '')}" for dev in devices
+            )
+            logging.getLogger(__name__).warning(
+                "Camera name '%s' not found among cameras:\n%s\nfalling back to device_id=%s",
+                device_name, device_lines, fallback_id,
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                "Camera name '%s' not found; no cameras enumerated; falling back to device_id=%s",
+                device_name, fallback_id,
+            )
 
     return getattr(config.camera, 'device_id', 0) if hasattr(config, 'camera') else 0
 

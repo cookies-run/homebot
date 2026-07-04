@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 class CameraConfig:
     """摄像头配置
 
-    macOS 上推荐使用 device_name 或 unique_id（最稳定），VisionService 会
-    自动使用 AVFoundation 原生驱动，绕过 OpenCV 易变的整数索引。
+    Windows/macOS 上推荐使用 device_name；macOS 还可使用 unique_id（最稳定）。
+    VisionService 在 macOS 会自动使用 AVFoundation 原生驱动，绕过 OpenCV
+    易变的整数索引；Windows 会先按真实设备名解析到 DirectShow/OpenCV 索引。
 
     示例设备名称（通过 `python -m services.vision_service --list-cameras` 查看）：
         "1080P USB Camera"  -> 外接 USB 摄像头 (1920x1080)
