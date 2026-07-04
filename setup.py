@@ -21,6 +21,7 @@ setup(
         "fastmcp>=2.14.0",
         "websockets>=12.0",
         "volcengine-python-sdk",
+        "cv2-enumerate-cameras>=1.1.12; platform_system=='Windows'",
     ],
     include_package_data=True,
 )

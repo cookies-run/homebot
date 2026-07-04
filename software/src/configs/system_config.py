@@ -24,6 +24,8 @@ class CameraConfig:
     device_id: int = 0   # OpenCV 设备索引（Linux/Windows 使用；macOS 仅作 fallback）
     device_name: str = "1080P USB Camera"  # 按名称查找摄像头（主摄像头），非空时优先于 device_id
     unique_id: str = ""    # macOS AVFoundation 稳定硬件标识（最优先）
+    device_path: str = ""  # Windows DirectShow/MSMF 稳定设备路径；macOS 也可复用为 uniqueID 的替代。
+                           # 匹配优先级：device_path > unique_id > device_name > device_id
     width: int = 1920     # 摄像头原始分辨率
     height: int = 1080
     fps: int = 30

@@ -16,3 +16,6 @@ websockets>=12.0
 
 # 火山引擎LLM依赖
 volcengine-python-sdk
+
+# Windows 下稳定枚举摄像头（获取 friendly name / device path / VID/PID）
+cv2-enumerate-cameras>=1.1.12; platform_system=="Windows"

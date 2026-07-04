@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--device', type=int, default=None, help='Camera device ID (default: from config)')
     parser.add_argument('--device-name', default=None, help='Camera device name substring (default: from config)')
     parser.add_argument('--unique-id', default=None, help='macOS AVFoundation uniqueID (default: from config)')
+    parser.add_argument('--device-path', default=None, help='Windows DirectShow/MSMF stable device path (default: from config)')
     parser.add_argument('--flip-horizontal', action='store_true', help='Flip image horizontally (mirror)')
     parser.add_argument('--list-cameras', action='store_true', help='List available cameras and exit')
     args = parser.parse_args()
@@ -28,9 +29,9 @@ def main():
         print_camera_list()
         return
 
-    # 如果指定了 device / device_name / unique_id，临时修改 config
+    # 如果指定了 device / device_name / unique_id / device_path，临时修改 config
     config = None
-    if args.device is not None or args.device_name is not None or args.unique_id is not None:
+    if args.device is not None or args.device_name is not None or args.unique_id is not None or args.device_path is not None:
         import copy
         base_config = get_config()
         config = copy.deepcopy(base_config)
@@ -43,6 +44,9 @@ def main():
         if args.unique_id is not None:
             config.camera.unique_id = args.unique_id
             print(f"[VisionService] Using camera unique_id='{args.unique_id}'")
+        if args.device_path is not None:
+            config.camera.device_path = args.device_path
+            print(f"[VisionService] Using camera device_path='{args.device_path}'")
 
     flip = args.flip_horizontal
     if args.addr:

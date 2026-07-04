@@ -81,47 +81,77 @@ def list_cameras(test_open: bool = False) -> List[Dict[str, Any]]:
     """列出所有摄像头设备"""
     devices = []
     try:
-        import cv2
-        
-        # 尝试检测前10个摄像头索引
+        from hal.camera.enumeration import list_camera_devices
+
         print("   正在扫描摄像头设备...")
         found_any = False
-        
-        # 选择正确的后端
-        if sys.platform == "win32":
-            backend = cv2.CAP_DSHOW
-        elif sys.platform == "darwin":
-            backend = cv2.CAP_AVFOUNDATION
-        else:
-            backend = cv2.CAP_V4L2
 
-        for index in range(10):
-            cap = cv2.VideoCapture(index, backend)
-            if cap.isOpened():
-                found_any = True
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                backend = cap.getBackendName() if hasattr(cap, 'getBackendName') else "未知"
-                
-                device_info = {
-                    "index": index,
-                    "width": width,
-                    "height": height,
-                    "fps": fps,
-                    "backend": backend,
-                }
-                devices.append(device_info)
-                
-                # 打印设备信息
-                status = "✅ 可打开" if test_open else ""
-                print(f"\n   📷 摄像头索引: {index} {status}")
+        camera_infos = list_camera_devices()
+        if not camera_infos:
+            print("   未找到摄像头设备")
+            return devices
+
+        import cv2
+        for cam in camera_infos:
+            found_any = True
+            index = cam.index
+            name = cam.name
+            path = cam.path
+            backend = cam.backend
+            vid = cam.vid
+            pid = cam.pid
+
+            # 尝试打开以获取分辨率/帧率；部分平台 index 为 -1 时跳过
+            width = height = fps = 0
+            if index >= 0:
+                cap_backend = backend if backend is not None else cv2.CAP_DSHOW if sys.platform == "win32" else (cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_V4L2)
+                cap = cv2.VideoCapture(index, cap_backend)
+                if cap.isOpened():
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+
+            device_info = {
+                "index": index,
+                "name": name,
+                "path": path,
+                "vid": vid,
+                "pid": pid,
+                "backend": backend,
+                "width": width,
+                "height": height,
+                "fps": fps,
+            }
+            devices.append(device_info)
+
+            # 打印设备信息
+            status = "✅ 可打开" if test_open else ""
+            backend_name = "未知"
+            if backend is not None:
+                try:
+                    backend_name = cv2.videoio_registry.getBackendName(backend)
+                except Exception:
+                    backend_name = str(backend)
+            elif path:
+                # macOS AVFoundation 等原生枚举不提供 OpenCV backend
+                backend_name = "AVFoundation/native"
+            print(f"\n   📷 摄像头索引: {index} {status}")
+            print(f"      名称: {name}")
+            if path:
+                print(f"      设备路径: {path}")
+            if vid is not None and pid is not None:
+                print(f"      VID/PID: {vid:04X}:{pid:04X}")
+            print(f"      后端: {backend_name}")
+            if width and height:
                 print(f"      分辨率: {width}x{height}")
-                print(f"      帧率: {fps:.1f} fps" if fps > 0 else "      帧率: 未知")
-                print(f"      后端: {backend}")
+            if fps > 0:
+                print(f"      帧率: {fps:.1f} fps")
 
-                # 如果请求测试，显示预览
-                if test_open:
+            # 如果请求测试，显示预览
+            if test_open and index >= 0:
+                cap_backend = backend if backend is not None else cv2.CAP_DSHOW if sys.platform == "win32" else (cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_V4L2)
+                cap = cv2.VideoCapture(index, cap_backend)
+                if cap.isOpened():
                     print(f"      正在测试预览，按 'q' 键继续...")
                     test_count = 0
                     while test_count < 150:  # 最多显示5秒 (30fps * 5)
@@ -135,17 +165,16 @@ def list_cameras(test_open: bool = False) -> List[Dict[str, Any]]:
                             print(f"      ⚠️ 无法读取帧")
                             break
                     cv2.destroyAllWindows()
+                    cap.release()
 
-                cap.release()
-            
         if not found_any:
             print("   未找到摄像头设备")
-            
+
     except ImportError:
         print("   ❌ 未安装 opencv-python，请先安装: pip install opencv-python")
     except Exception as e:
         print(f"   ❌ 获取摄像头信息失败: {e}")
-        
+
     return devices
 
 
@@ -357,8 +386,13 @@ def print_summary(serial_devices: List[Dict], camera_devices: List[Dict], mic_de
     if camera_devices:
         for dev in camera_devices:
             idx = dev.get("index", 0)
-            print(f"\n   👉 可用摄像头: 索引 {idx}")
+            name = dev.get("name", "未知")
+            path = dev.get("path", "")
+            print(f"\n   👉 可用摄像头: 索引 {idx} - {name}")
             print(f"      修改: camera.device_id = {idx}")
+            print(f"      修改: camera.device_name = \"{name}\"")
+            if path:
+                print(f"      修改: camera.device_path = \"{path}\"")
     else:
         print("   未检测到摄像头设备")
         

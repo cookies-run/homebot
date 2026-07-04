@@ -47,22 +47,30 @@ class VisionService:
             import platform
             device_name = getattr(config.camera, 'device_name', '')
             unique_id = getattr(config.camera, 'unique_id', '')
-            if platform.system() == 'Darwin' and (device_name or unique_id):
+            device_path = getattr(config.camera, 'device_path', '')
+            if platform.system() == 'Darwin' and (device_name or unique_id or device_path):
                 # macOS 使用 AVFoundation 原生驱动，按名称/uniqueID 匹配，
-                # 不经过 OpenCV 的整数索引，因此跳过 resolve_device_id。
+                # 不经过 OpenCV 的整数索引，因此跳过 resolve_camera_descriptor。
                 self._cam_device = -1
+                self._cam_backend = None
+                self._cam_descriptor = None
             else:
-                from hal.camera.enumeration import resolve_device_id
-                self._cam_device = resolve_device_id(config)
+                from hal.camera.enumeration import resolve_camera_descriptor
+                desc = resolve_camera_descriptor(config)
+                self._cam_device = desc.index
+                self._cam_backend = desc.backend
+                self._cam_descriptor = desc
             self._fps = getattr(config.camera, 'fps', 30)
             self._width = getattr(config.camera, 'width', 640)
             self._height = getattr(config.camera, 'height', 480)
         else:
             self._cam_device = 0
+            self._cam_backend = None
+            self._cam_descriptor = None
             self._fps = 30
             self._width = 640
             self._height = 480
-        
+
         self._flip_horizontal = flip_horizontal
 
         # 相机驱动 (延迟初始化)
@@ -81,12 +89,13 @@ class VisionService:
         camera_cfg = getattr(self._config, 'camera', None)
         device_name = getattr(camera_cfg, 'device_name', '') if camera_cfg else ''
         unique_id = getattr(camera_cfg, 'unique_id', '') if camera_cfg else ''
+        device_path = getattr(camera_cfg, 'device_path', '') if camera_cfg else ''
 
-        if platform.system() == 'Darwin' and (device_name or unique_id):
+        if platform.system() == 'Darwin' and (device_name or unique_id or device_path):
             from hal.camera.avfoundation_driver import AVFoundationCameraDriver
             self._cam = AVFoundationCameraDriver(
                 device_name=device_name,
-                unique_id=unique_id,
+                unique_id=unique_id or device_path,
                 width=self._width,
                 height=self._height,
                 fps=self._fps,
@@ -100,14 +109,18 @@ class VisionService:
         else:
             from hal.camera.driver import CameraDriver
             self._cam = CameraDriver(
-                self._cam_device,
+                device=self._cam_device,
+                device_name=device_name,
+                device_path=device_path,
+                unique_id=unique_id,
+                backend=self._cam_backend,
                 flip_horizontal=self._flip_horizontal,
                 width=self._width,
                 height=self._height,
             )
             logger.info(
-                f"OpenCV camera initialized: device={self._cam_device}, fps={self._fps}, "
-                f"resolution={self._width}x{self._height}, flip_horizontal={self._flip_horizontal}"
+                f"OpenCV camera initialized: device={self._cam_device}, backend={self._cam_backend}, "
+                f"fps={self._fps}, resolution={self._width}x{self._height}, flip_horizontal={self._flip_horizontal}"
             )
 
     def process_frame(self, frame):
