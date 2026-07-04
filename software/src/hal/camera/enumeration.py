@@ -3,8 +3,9 @@
 提供按名称/设备路径查找摄像头的功能，避免 Windows/macOS 上 device_id 随插拔顺序漂移的问题。
 
 在 Windows 上，本模块优先使用 ``cv2-enumerate-cameras`` 枚举 DirectShow/MSMF 设备，返回
-真实 friendly name、稳定 device path、VID/PID 以及对应的 OpenCV backend/index。缺失该
-依赖时自动降级到传统 OpenCV 索引扫描。
+真实 friendly name、稳定 device path、VID/PID 以及对应的 OpenCV backend/index。若该依赖
+不可用，则降级到 PowerShell/CIM + OpenCV 探测方案获取真实设备名并映射到可读索引。最后
+才回退到传统 OpenCV 索引扫描。
 
 在 macOS 上，本模块使用原生的 AVFoundation API（通过 PyObjC）进行枚举，返回的设备信息
 包含稳定的 ``uniqueID``（硬件级标识，插拔不变）。当 VisionService 配置 ``camera.device_name``
@@ -18,7 +19,7 @@ import platform
 import subprocess
 import re
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Dict, Optional
 
 
@@ -154,7 +155,8 @@ def _list_cameras_linux() -> List[CameraDescriptor]:
 
 
 def _list_cameras_windows() -> List[CameraDescriptor]:
-    """Windows: 优先使用 cv2-enumerate-cameras 获取真实设备名与稳定路径。"""
+    """Windows: 优先获取真实设备名与稳定路径，再映射到 OpenCV 索引。"""
+    # 1) 优先 cv2-enumerate-cameras：可拿到 path / VID / PID / backend
     try:
         return _list_cameras_windows_cv2_enum()
     except Exception as e:
@@ -162,9 +164,21 @@ def _list_cameras_windows() -> List[CameraDescriptor]:
         logger = logging.getLogger(__name__)
         logger.warning(
             f"[CameraEnum] cv2-enumerate-cameras 不可用或枚举失败 ({e})，"
-            "降级到 OpenCV 索引扫描。"
+            "降级到 PowerShell/CIM + OpenCV 探测方案。"
         )
-        return _list_cameras_windows_legacy()
+
+    # 2) 降级到 PowerShell/CIM 名称 + OpenCV 索引探测
+    try:
+        return _list_cameras_windows_cim()
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            f"[CameraEnum] PowerShell/CIM 枚举失败 ({e})，降级到 OpenCV 索引扫描。"
+        )
+
+    # 3) 最后回退到纯 OpenCV 索引扫描
+    return _list_cameras_windows_legacy()
 
 
 def _list_cameras_windows_cv2_enum() -> List[CameraDescriptor]:
@@ -187,22 +201,157 @@ def _list_cameras_windows_cv2_enum() -> List[CameraDescriptor]:
     return devices
 
 
-def _list_cameras_windows_legacy() -> List[CameraDescriptor]:
-    """Windows: OpenCV 不直接提供设备名，按索引枚举（fallback）。"""
+def _list_cameras_windows_cim() -> List[CameraDescriptor]:
+    """Windows: 通过 PowerShell/CIM 获取真实名称，并映射到 OpenCV 可读索引。"""
     import cv2
-    devices = []
-    for i in range(10):
-        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            devices.append(
-                CameraDescriptor(
-                    index=i,
-                    name=f'Camera {i}',
-                    backend=cv2.CAP_DSHOW,
-                )
+    import logging
+
+    logger = logging.getLogger(__name__)
+    open_indices = _probe_windows_camera_indices()
+    real_names = _list_windows_camera_names()
+
+    if real_names:
+        mapped = _map_windows_camera_names_to_indices(real_names, open_indices)
+        if len(real_names) != len(open_indices):
+            logger.warning(
+                "[CameraEnum] Windows camera name count (%s) differs from readable OpenCV index count (%s); "
+                "using role-aware external camera mapping: names=%s, indices=%s, mapped=%s",
+                len(real_names), len(open_indices), real_names, open_indices, mapped,
             )
+        return [
+            CameraDescriptor(index=dev['index'], name=dev['name'], backend=cv2.CAP_DSHOW)
+            for dev in mapped
+        ]
+
+    logger.warning("[CameraEnum] Windows real-name enumeration unavailable; falling back to Camera N labels")
+    return [
+        CameraDescriptor(index=i, name=f'Camera {i}', backend=cv2.CAP_DSHOW)
+        for i in open_indices
+    ]
+
+
+def _probe_windows_camera_indices() -> List[int]:
+    """探测 Windows 上可读取画面的 OpenCV 摄像头索引。"""
+    import cv2
+
+    backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+    indices = []
+    for i in range(10):
+        for backend in backends:
+            cap = cv2.VideoCapture(i, backend)
+            ok = cap.isOpened()
+            ret = False
+            if ok:
+                ret, frame = cap.read()
+                ret = ret and frame is not None
             cap.release()
-    return devices
+            if ret:
+                indices.append(i)
+                break
+    return indices
+
+
+def _map_windows_camera_names_to_indices(names: List[str], indices: List[int]) -> List[Dict]:
+    """按 HomeBot 摄像头角色把 Windows 真实名称映射到 OpenCV 索引。"""
+    if not names:
+        return []
+
+    # 当前 HomeBot Windows 设备形态：过滤内置/音频设备后，真实名称通常只剩
+    # 机身 1080P USB Camera 和末端 USB Camera；OpenCV 可读索引仍可能包含
+    # 笔记本摄像头。实测 /run 启动时 index 0 会落到笔记本，末端在最后一路，
+    # 因此 3 路可读时跳过 index 0：机身取中间一路，末端取最后一路。
+    if len(names) == 2 and len(indices) >= 3:
+        return [
+            {'index': indices[1], 'name': names[0]},
+            {'index': indices[-1], 'name': names[1]},
+        ]
+
+    if len(indices) >= len(names):
+        selected_indices = indices[:len(names)]
+    else:
+        selected_indices = indices + list(range(len(indices), len(names)))
+
+    return [
+        {'index': selected_indices[pos], 'name': name}
+        for pos, name in enumerate(names)
+    ]
+
+
+def _list_windows_camera_names() -> List[str]:
+    """通过 PowerShell/CIM 获取 Windows 摄像头真实名称。"""
+    script = r"""
+$devices = Get-CimInstance Win32_PnPEntity |
+    Where-Object {
+        $_.Name -and
+        $_.Name -notmatch 'audio|microphone|麦克风|音频|integrated|built-in|builtin|内置|facetime' -and
+        (
+            $_.PNPClass -eq 'Camera' -or
+            $_.PNPClass -eq 'Image' -or
+            (
+                $_.PNPClass -notin @('AudioEndpoint', 'MEDIA') -and
+                $_.Name -match 'camera|摄像头|webcam|usb video|usb2\.0|1080p'
+            )
+        )
+    } |
+    Select-Object -ExpandProperty Name
+$devices | ConvertTo-Json -Compress
+""".strip()
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', script],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, str):
+            names = [data]
+        else:
+            names = [str(item) for item in data if item]
+        return _dedupe_names(names)
+    except Exception:
+        return []
+
+
+def _dedupe_names(names: List[str]) -> List[str]:
+    """保留顺序去重。"""
+    seen = set()
+    result = []
+    for name in names:
+        normalized = _normalize_camera_name(name)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(name.strip())
+    return result
+
+
+def _normalize_camera_name(name: str) -> str:
+    """统一摄像头名称，便于跨平台不区分大小写/空白/中英文后缀匹配。"""
+    normalized = str(name or '').strip().casefold()
+    normalized = normalized.replace('摄像头', 'camera')
+    return re.sub(r'\s+', '', normalized)
+
+
+def _match_score(name: str, target: str) -> int:
+    """名称匹配强度评分，越高越优先。
+
+    Returns:
+        3: 精确匹配
+        2: target 是 name 的子串
+        1: name 是 target 的子串（弱匹配）
+        0: 不匹配
+    """
+    norm_name = _normalize_camera_name(name)
+    norm_target = _normalize_camera_name(target)
+    if not norm_name or not norm_target:
+        return 0
+    if norm_name == norm_target:
+        return 3
+    if norm_target in norm_name:
+        return 2
+    if norm_name in norm_target:
+        return 1
+    return 0
 
 
 def find_camera_descriptor(
@@ -210,18 +359,26 @@ def find_camera_descriptor(
     path: str = "",
     unique_id: str = "",
 ) -> Optional[CameraDescriptor]:
-    """按名称子串、设备路径或唯一标识查找摄像头。
+    """按名称、设备路径或唯一标识查找摄像头。
+
+    名称匹配规则：
+        - 优先精确匹配（忽略大小写/空白/中英文摄像头后缀）
+        - 其次 ``target`` 是设备名子串
+        - 最后设备名是 ``target`` 子串（弱匹配）
 
     Args:
-        name: friendly name 子串，不区分大小写。
+        name: friendly name。
         path: Windows DirectShow/MSMF 稳定设备路径（精确匹配，不区分大小写）。
         unique_id: macOS AVFoundation uniqueID（精确匹配，不区分大小写）。
 
     Returns:
         匹配到的 ``CameraDescriptor``；未找到返回 None。
     """
+    import logging
+    logger = logging.getLogger(__name__)
     devices = list_camera_devices()
 
+    # 1) path / unique_id 精确匹配（最稳定）
     target_path = (path or unique_id).lower()
     if target_path:
         for dev in devices:
@@ -229,24 +386,40 @@ def find_camera_descriptor(
             if dev_path and dev_path == target_path:
                 return dev
 
-    if name:
-        matches = [dev for dev in devices if name.lower() in dev.name.lower()]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"Camera name '{name}' 匹配到多个摄像头，请使用 device_path 区分：\n" +
-                "\n".join(f"  [{d.index}] {d.name}  path={d.path}" for d in matches)
-            )
+    if not name:
+        return None
 
-    return None
+    # 2) 名称匹配：按强度分组
+    best_score = 0
+    candidates = []
+    for dev in devices:
+        score = _match_score(dev.name, name)
+        if score > best_score:
+            best_score = score
+            candidates = [dev]
+        elif score == best_score and score > 0:
+            candidates.append(dev)
+
+    if not candidates:
+        return None
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # 多个同强度匹配：警告并返回第一个，避免静默错配
+    logger.warning(
+        "[CameraEnum] Multiple camera matches for '%s' (score=%s): %s; "
+        "consider using device_path for deterministic matching.",
+        name, best_score, [(d.index, d.name, d.path) for d in candidates]
+    )
+    return candidates[0]
 
 
 def find_camera_index(name_substring: str) -> Optional[int]:
-    """根据摄像头名称子串查找对应的 OpenCV 设备索引（非 macOS 场景使用）。
+    """根据摄像头名称查找对应的 OpenCV 设备索引（非 macOS 场景使用）。
 
     Args:
-        name_substring: 名称子串，不区分大小写。例如 "USB"、"FaceTime"。
+        name_substring: 名称或子串，不区分大小写。例如 "USB"、"FaceTime"。
 
     Returns:
         匹配到的设备索引；如果未找到则返回 None。
@@ -265,7 +438,7 @@ def resolve_camera_descriptor(config) -> CameraDescriptor:
     匹配优先级：
         1. ``config.camera.device_path`` 精确匹配
         2. ``config.camera.unique_id`` 精确匹配
-        3. ``config.camera.device_name`` 子串匹配（命中多个时抛错）
+        3. ``config.camera.device_name`` 名称匹配
         4. 回退到 ``config.camera.device_id``
 
     Args:
@@ -364,13 +537,13 @@ def print_camera_list():
     for dev in devices:
         extras = []
         if dev.path:
-            extras.append(f"path=\"{dev.path}\"")
+            extras.append(f'path="{dev.path}"')
         if dev.vid is not None and dev.pid is not None:
             extras.append(f"VID/PID={dev.vid:04X}:{dev.pid:04X}")
         if dev.backend is not None:
             extras.append(f"backend={dev.backend}")
         if dev.unique_id:
-            extras.append(f"uniqueID=\"{dev.unique_id}\"")
+            extras.append(f'uniqueID="{dev.unique_id}"')
         extra_str = f"  {' '.join(extras)}" if extras else ""
         print(f"  [{dev.index}] \"{dev.name}\"{extra_str}")
 

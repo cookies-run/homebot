@@ -1,6 +1,6 @@
 """Camera driver implementation using OpenCV."""
 
-from typing import Optional
+from typing import List, Optional
 from common.logging import get_logger
 
 logger = get_logger(__name__)
@@ -79,44 +79,47 @@ class CameraDriver:
             except Exception as e:
                 logger.warning(f"CameraDriver failed to resolve descriptor: {e}")
 
-        import sys
-        import cv2
-        if self._backend is not None:
-            backend = self._backend
-        elif sys.platform == "win32":
-            backend = cv2.CAP_DSHOW
-        elif sys.platform == "darwin":
-            backend = cv2.CAP_AVFOUNDATION
-        else:
-            backend = cv2.CAP_V4L2
-
         from hal.camera.enumeration import CameraDescriptor
-        return CameraDescriptor(index=fallback_device, name=f"Camera {fallback_device}", backend=backend)
+        return CameraDescriptor(
+            index=fallback_device,
+            name=f"Camera {fallback_device}",
+            backend=self._backend,
+        )
 
     def _create_capture(self):
-        """创建并配置 VideoCapture 实例."""
+        """创建并配置 VideoCapture 实例.
+
+        若显式指定了 backend 则优先使用；否则按平台尝试多个常用 backend，
+        提高 Windows 下不同驱动/摄像头组合的兼容性。
+        """
         import cv2
         import sys
 
         if self._backend is not None:
-            backend = self._backend
+            backends = [self._backend]
         elif sys.platform == "win32":
-            backend = cv2.CAP_DSHOW
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
         elif sys.platform == "darwin":
-            backend = cv2.CAP_AVFOUNDATION
+            backends = [cv2.CAP_AVFOUNDATION]
         else:
-            backend = cv2.CAP_V4L2
+            backends = [cv2.CAP_V4L2]
 
-        cap = cv2.VideoCapture(self._device, backend)
-        if cap.isOpened() and (self._width > 0 or self._height > 0):
-            if self._width > 0:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-            if self._height > 0:
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            logger.info(f"camera {self._device} resolution set to {actual_w}x{actual_h}")
-        return cap
+        for backend in backends:
+            cap = cv2.VideoCapture(self._device, backend)
+            if cap.isOpened():
+                if self._width > 0 or self._height > 0:
+                    if self._width > 0:
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+                    if self._height > 0:
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+                    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    logger.info(f"camera {self._device} resolution set to {actual_w}x{actual_h}")
+                logger.info(f"camera {self._device} opened with backend {backend}")
+                return cap
+            cap.release()
+
+        return None
 
     def capture_frame(self, retries: int = 3):
         """Capture a single frame and return as numpy array (BGR).

@@ -35,7 +35,7 @@ from scripts.arm_control import HomeBotArmController
 from scripts.what_does_robot_see_workflow import WhatDoesRobotSeeWorkflow
 # 使用 grab_optimized 中的五阶段状态机抓取工作流
 from scripts.grab_optimized import AutoGrabWorkflow
-from scripts.robot_config import ROBOT_IP, CHASSIS_PORT, ARM_PORT, VIDEO_PORT
+from scripts.robot_config import ROBOT_IP, CHASSIS_PORT, ARM_PORT, VIDEO_PORT, END_VIDEO_PORT
 
 
 # -----------------------------------------------------------------------------
@@ -272,7 +272,8 @@ async def auto_grab(
     try:
         workflow = AutoGrabWorkflow(
             robot_ip=ROBOT_IP,
-            video_port=5560,
+            video_port=VIDEO_PORT,
+            end_video_port=END_VIDEO_PORT,
             arm_port=ARM_PORT,
             max_attempts=8,
             use_end_camera=use_end_camera,
